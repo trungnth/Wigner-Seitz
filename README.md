@@ -45,10 +45,10 @@ Produces a 4-column array:
 
 | Column | Description |
 |---|---|
-| `c_ID[1]` | **Occupancy** — Total number of current atoms residing in the mapped reference cell. Values `>= 2` indicate an interstitial or co-location cluster. |
-| `c_ID[2]` | **Site Index** — Internal memory index of the reference cell. |
-| `c_ID[3]` | **Site Identifier** — Original Atom ID (`atom->tag`) that defined this geometric site at Step 0. Comparing `id != c_ID[3]` identifies mixing/replacement atoms. |
-| `c_ID[4]` | **Site Type** — Original element type of the site. Comparing `type != c_ID[4]` identifies anti-site defects. |
+| `c_ID[1]` | **Occupancy** - Total number of current atoms residing in the mapped reference cell. Values `>= 2` indicate an interstitial or co-location cluster. |
+| `c_ID[2]` | **Site Index** - Internal memory index of the reference cell. |
+| `c_ID[3]` | **Site Identifier** - Original Atom ID (`atom->tag`) that defined this geometric site at Step 0. Comparing `id != c_ID[3]` identifies mixing/replacement atoms. |
+| `c_ID[4]` | **Site Type** - Original element type of the site. Comparing `type != c_ID[4]` identifies anti-site defects. |
 
 ---
 
@@ -81,7 +81,7 @@ Outputs system-wide defect totals integrated across all MPI processors.
 | `c_ID[1]` | Total interstitials in the simulation at current timestep. Includes lattice interstitial defects and atoms sputtered in case of sputtering simulation with open surface. |
 | `c_ID[2]` | Total vacancies in the simulation at current timestep. |
 | `c_ID[3]` | Total replacements (mixing atoms) in the simulation at current timestep. |
-| `c_ID[4]` | Total antisites (chemical mixing in multi-element materials) defects in the simulation at current timestep.
+| `c_ID[4]` | Total antisites defects (chemical mixing in multi-element materials) in the simulation at current timestep.
 
 ---
 
@@ -136,7 +136,7 @@ Enable the `VORONOI` package, use the `DOWNLOAD_VORO=yes` flag to instruct CMake
 cmake -D PKG_VORONOI=ON -D DOWNLOAD_VORO=yes -D BUILD_MPI=ON ../cmake
 ```
 
-> Note: You can append any additional CMake flags here depending on your required configuration. Below is an example of building LAMMPS with the custom `compute ws` style for a DGX node equipped with NVIDIA V100 GPUs on the HYBRILIT computing platform at MLIT using the `most.cmake` preset.
+You can append any additional CMake flags here depending on your required configuration. Below is an example of building LAMMPS with the custom `compute ws` style for a DGX node equipped with NVIDIA V100 GPUs on the HYBRILIT computing platform at MLIT using the `most.cmake` preset.
 
 ```bash
 module load gcc/v12.3.0 cuda/v12.8 openmpi/v4.1.8_gcc1230 CMake/v4.2.3 LAPACK/v3.12.0_gcc1230
