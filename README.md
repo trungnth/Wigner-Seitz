@@ -138,7 +138,7 @@ You can append any additional CMake flags here depending on your required config
 
 ```bash
 module load gcc/v12.3.0 cuda/v12.8 openmpi/v4.1.8_gcc1230 CMake/v4.2.3 LAPACK/v3.12.0_gcc1230
-cmake -C ../cmake/presets/most.cmake -D BUILD_MPI=ON -D PKG_GPU=ON -D GPU_API=cuda -D GPU_ARCH=sm_70 -D PKG_OPENMP=ON -D CMAKE_C_COMPILER=gcc -D CMAKE_CXX_COMPILER=g++ ../cmake
+cmake -C ../cmake/presets/most.cmake -D PKG_VORONOI=ON -D DOWNLOAD_VORO=yes -D BUILD_MPI=ON -D PKG_GPU=ON -D GPU_API=cuda -D GPU_ARCH=sm_70 -D PKG_OPENMP=ON -D CMAKE_C_COMPILER=gcc -D CMAKE_CXX_COMPILER=g++ ../cmake
 ```
 ### 3. Compile the executable
 
