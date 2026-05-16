@@ -27,11 +27,9 @@ thermo_style custom step temp c_1[1] c_1[2] c_1[3] c_1[4]
 
 ## Description
 
-`compute ws` defines a computation that tracks radiation damage and point defects on-the-fly using exact Wigner-Seitz cell analysis via the Voro++ library.
+The `compute ws` command identifies and classifies point defects on-the-fly using exact Wigner-Seitz cell analysis via the Voro++ library.
 
-The compute evaluates the system upon its first invocation (typically via a `run 0` command) and stores the perfect pristine lattice coordinates, atom IDs, and atom types into a permanent reference memory.
-
-During subsequent timesteps, the compute maps the coordinates of currently displaced atoms onto the static reference cells.
+The compute evaluates the system upon its first invocation (typically via a `run 0` command) and stores the perfect pristine lattice coordinates, atom IDs, and atom types into a permanent reference memory. During subsequent timesteps, the compute maps the coordinates of currently displaced atoms onto the static reference cells.
 
 The compute functions polymorphically, simultaneously generating three distinct data streams depending on the calling command.
 
@@ -39,7 +37,7 @@ The compute functions polymorphically, simultaneously generating three distinct 
 
 ## 1. Per-Atom Array (Displaced Atom Data)
 
-Accessed by atom-style commands such as `dump custom` or `variable atom`.
+Accessed by atom-style commands such as `dump custom` or `variable atom`. It can be used to define a LAMMPS dynamic group to track these specific atoms on-the-fly.
 
 Produces a 4-column array:
 
@@ -47,7 +45,7 @@ Produces a 4-column array:
 |---|---|
 | `c_ID[1]` | **Occupancy** - Total number of current atoms residing in the mapped reference cell. Values `>= 2` indicate an interstitial or co-location cluster. |
 | `c_ID[2]` | **Site Index** - Internal memory index of the reference cell. |
-| `c_ID[3]` | **Site Identifier** - Original Atom ID (`atom->tag`) that defined this geometric site at Step 0. Comparing `id != c_ID[3]` identifies mixing/replacement atoms. |
+| `c_ID[3]` | **Site Identifier** - Original Atom ID that defined this geometric site at Step 0. Comparing `id != c_ID[3]` identifies mixing/replacement atoms. |
 | `c_ID[4]` | **Site Type** - Original element type of the site. Comparing `type != c_ID[4]` identifies anti-site defects. |
 
 ---
@@ -56,14 +54,14 @@ Produces a 4-column array:
 
 Accessed by local-style commands.
 
-To correctly visualize vacancies as physical particles in visualization tools like OVITO, it is highly recommended to use the custom `dump ws/vac` style command.
+To correctly visualize vacancies as physical particles in visualization tools, it is highly recommended to use the custom `dump ws/vac` style command.
 
 Produces a 5-column local array ordered for standard particle visualization:
 
 | Column | Description |
 |---|---|
-| `c_ID[1]` | Original ID (`atom->tag`) of the reference atom that previously occupied this vacancy. |
-| `c_ID[2]` | Original type of the reference atom that previously occupied this vacancy. |
+| `c_ID[1]` | Original ID of the atom in reference lattice that previously occupied this vacancy. |
+| `c_ID[2]` | Original type of the atom in reference lattice that previously occupied this vacancy. |
 | `c_ID[3]` | X coordinate of the vacancy. |
 | `c_ID[4]` | Y coordinate of the vacancy. |
 | `c_ID[5]` | Z coordinate of the vacancy. |
