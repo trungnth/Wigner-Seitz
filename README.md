@@ -1,151 +1,152 @@
-# LAMMPS Documentation: `compute ws`
+# `compute ws` command for LAMMPS
+
+A custom LAMMPS compute command for on-the-fly **Wigner-Seitz (WS) defect analysis**, identifying and classifying point defects such as vacancies, interstitials, replacements, and antisites.
+
+## Table of Contents
+
+* [Syntax](#syntax)
+* [Examples](#examples)
+* [Description](#description)
+  * [Classification of Defects](#classification-of-defects)
+  * [Voronoi Container and Skin Buffer](#voronoi-container-and-skin-buffer)
+* [Output Information](#output-information)
+  * [Global Vector (Defect Tallies)](#1-global-vector-defect-tallies)
+  * [Per-Atom Array (Site Properties)](#2-per-atom-array-site-properties)
+  * [Local Array (Vacancy Coordinates)](#3-local-array-vacancy-coordinates)
+* [Prerequisites & Restrictions](#prerequisites--restrictions)
+* [Related Commands](#related-commands)
+* [Default Values](#default-values)
+
+---
 
 ## Syntax
 
 ```lammps
 compute ID group-ID ws
+compute ID group-ID ws skin
 ```
 
-- `ID`, `group-ID` are documented in the `compute` command.
-- `ws` = name of this compute style.
+* **`ID`**, **`group-ID`**: Documented in the standard LAMMPS [`compute`](https://docs.lammps.org/compute.html) command.
+* **`ws`**: Style name of this compute command.
+* **`skin`**: *(Optional)* Voronoi container expansion buffer (distance units).
 
 ---
 
 ## Examples
 
 ```lammps
+# 1. Default usage (automatically synchronizes with LAMMPS neighbor skin)
 compute 1 all ws
 
-dump defects all custom 1000 dump.defects id type x y z c_1[1] c_1[2] c_1[3] c_1[4]
+# 2. Manual skin usage (e.g., for sputtering or non-periodic boundary condition simulations)
+compute 2 all ws 5.0
 
-dump vacs all ws/vac 1000 dump.vacs c_1[1] c_1[2] c_1[3] c_1[4] c_1[5]
+# Force the compute to evaluate and cache the reference lattice before dynamics
+run 0 
 
-thermo_style custom step temp c_1[1] c_1[2] c_1[3] c_1[4]
+# Output total defect tallies: [Interstitials, Vacancies, Replacements, Antisites]
+thermo_style custom step pe ke c_1[1] c_1[2] c_1[3] c_1[4]
+
+# Per-atom dump for WS site properties (occupancy, site index, site ID, site type)
+dump 1 all custom 100 dump.atoms.lammpstrj id type x y z c_1[1] c_1[2] c_1[3] c_1[4]
+
+# Local dump for reference coordinates and properties of identified vacancies
+dump 2 all local 100 dump.vacancies.lammpstrj c_1[1] c_1[2] c_1[3] c_1[4] c_1[5]
 ```
 
 ---
 
 ## Description
 
-The `compute ws` command identifies and classifies point defects on-the-fly using exact Wigner-Seitz cell analysis via the Voro++ library.
+The `compute ws` command defines a computation that performs Wigner-Seitz (WS) defect analysis to identify and classify point defects such as vacancies, interstitials, replacements, and antisites on-the-fly.
 
-The compute evaluates the system upon its first invocation (typically via a `run 0` command) and stores the perfect pristine lattice coordinates, atom IDs, and atom types into a permanent reference memory. During subsequent timesteps, the compute maps the coordinates of currently displaced atoms onto the static reference cells.
+This compute uses the [voro++](http://math.lbl.gov/voro++/) library to calculate the Voronoi polyhedra (Wigner-Seitz cells) based on a reference lattice.
 
-The compute functions polymorphically, simultaneously generating three distinct data streams depending on the calling command.
+### How It Works
 
----
+1. **Initialization:** When initialized (e.g., at `run 0`), the compute captures and stores the current atomic positions and types as the **reference lattice** on their respective MPI processors.
+2. **Defect Tracking:** In all subsequent timesteps, the compute maps the instantaneous atomic positions into the cached Wigner-Seitz cells of the reference lattice to determine WS site properties.
 
-## 1. Per-Atom Array (Displaced Atom Data)
+### Classification of Defects
 
-Accessed by atom-style commands such as `dump custom` or `variable atom`. It can be used to define a LAMMPS dynamic group to track these specific atoms on-the-fly.
+Based on the occupancy and the types of atoms within each WS cell, the compute classifies defects into four categories:
 
-Produces a 4-column array:
+* **Interstitials:** WS cells containing more than one atom. If a cell contains $N$ atoms, it contributes $N - 1$ to the total interstitial count.
+* **Vacancies:** WS cells containing no atoms (empty sites, occupancy = $0$).
+* **Replacements:** WS cells containing exactly one atom (occupancy = $1$), but with a different original ID than the reference atom.
+* **Antisites:** WS cells containing exactly one atom (occupancy = $1$), but of a different atom type than the original reference atom.
 
-| Column | Description |
-|---|---|
-| `c_ID[1]` | **Occupancy** - Total number of current atoms residing in the mapped reference cell. Values `>= 2` indicate an interstitial or co-location cluster. |
-| `c_ID[2]` | **Site Index** - Internal memory index of the reference cell. |
-| `c_ID[3]` | **Site Identifier** - Original Atom ID that defined this geometric site at Step 0. Comparing `id != c_ID[3]` identifies mixing/replacement atoms. |
-| `c_ID[4]` | **Site Type** - Original element type of the site. Comparing `type != c_ID[4]` identifies anti-site defects. |
+### Voronoi Container and Skin Buffer
 
----
+To construct mathematically rigorously bounded Voronoi cells, the compute creates a local container around the reference atoms:
 
-## 2. Local Array (Vacancy Dummy Atoms)
-
-Accessed by local-style commands.
-
-To correctly visualize vacancies as physical particles in visualization tools, it is highly recommended to use the custom `dump ws/vac` style command.
-
-Produces a 5-column local array ordered for standard particle visualization:
-
-| Column | Description |
-|---|---|
-| `c_ID[1]` | Original ID of the atom in reference lattice that previously occupied this vacancy. |
-| `c_ID[2]` | Original type of the atom in reference lattice that previously occupied this vacancy. |
-| `c_ID[3]` | X coordinate of the vacancy. |
-| `c_ID[4]` | Y coordinate of the vacancy. |
-| `c_ID[5]` | Z coordinate of the vacancy. |
+* **Dynamic Neighbor Skin:** By default, this compute dynamically synchronizes with the LAMMPS [`neighbor`](https://docs.lammps.org/neighbor.html) skin distance to expand the container boundaries.
+* **Manual Skin Override:** Users can optionally override the dynamic boundary by specifying a manual `skin` value.
+* **Non-Periodic Boundaries:** The compute supports systems with non-periodic boundaries. Atoms that evaporate or are sputtered beyond the boundaries of the established Voronoi container are safely ignored.
 
 ---
 
-## 3. Global Vector (Statistical Data)
+## Output Information
 
-Accessed by global-style commands such as `thermo_style`.
+This compute calculates a **global vector** of length 4, a **per-atom array** with 4 columns, and a **local array** with 5 columns.
 
-Outputs system-wide defect totals integrated across all MPI processors.
+### 1. Global Vector (Defect Tallies)
 
-| Column | Description |
-|---|---|
-| `c_ID[1]` | Total interstitials in the simulation at current timestep. Includes lattice interstitial defects and atoms sputtered in case of sputtering simulation with open surface. |
-| `c_ID[2]` | Total vacancies in the simulation at current timestep. |
-| `c_ID[3]` | Total replacements (mixing atoms) in the simulation at current timestep. |
-| `c_ID[4]` | Total antisites defects (chemical mixing in multi-element materials) in the simulation at current timestep.
+Values are accessible via index notation `c_ID[i]` ($1 \le i \le 4$), representing total defect counts across the system:
+
+| Index | Name | Description |
+| :---: | :--- | :--- |
+| `c_ID[1]` | **Interstitials** | Total number of interstitial atoms |
+| `c_ID[2]` | **Vacancies** | Total number of vacancies (empty sites) |
+| `c_ID[3]` | **Replacements** | Total number of replacement collisions |
+| `c_ID[4]` | **Antisites** | Total number of antisite defects |
+
+### 2. Per-Atom Array (Site Properties)
+
+Calculated for **every** atom in the compute group. 
+
+* For atoms that remain in their original lattice sites, `Occupancy` is typically 1, and `SiteIdentifier` and `SiteType` match the atom's own ID and type.
+* For atoms that have moved outside the reference Voronoi container, all values are set to `0`.
+
+| Column | Property | Description |
+| :---: | :--- | :--- |
+| **1** | **Occupancy** | Number of atoms currently residing in the WS cell where this atom is located |
+| **2** | **SiteIndex** | The MPI-local array index of the WS cell.<br>*(**Note:** This is an internal processor-specific index and is **not** globally unique. For post-processing and visualization, users should rely on `SiteIdentifier` (column 3) instead).* |
+| **3** | **SiteIdentifier** | Original atom ID of the reference atom defining this WS cell |
+| **4** | **SiteType** | Original atom type of the reference atom defining this WS cell |
+
+### 3. Local Array (Vacancy Coordinates)
+
+Outputs the reference coordinates and properties of identified **Vacancies** (empty WS cells):
+
+| Column | Property | Description |
+| :---: | :--- | :--- |
+| **1** | **ID** | Reference atom ID of the vacancy site |
+| **2** | **Type** | Reference atom type of the vacancy site |
+| **3** | **x** | Reference $x$-coordinate of the vacancy site |
+| **4** | **y** | Reference $y$-coordinate of the vacancy site |
+| **5** | **z** | Reference $z$-coordinate of the vacancy site |
 
 ---
 
-## Restrictions
+## Prerequisites & Restrictions
 
-- This compute requires the **VORONOI** package to be installed.
-- Currently supports only:
-  - 3D periodic boundaries
-  - fixed simulation boundaries
-- Load balancing (`fix balance`) that alters MPI domain boundaries after Step 0 is **not supported**, because it breaks the static ghost-atom reference maps.
-
----
-
-
-# Installation Instructions
-
-This custom compute and dump style relies on the exact polyhedral cell algorithms provided by the `voro++` library. Therefore, although it does not require `VORONOI` package code to function, the simplest and most straightforward way to compile the custom `compute ws` style is to build LAMMPS with the `VORONOI` package enabled.
-
-
-## Prerequisites: Positioning the Source Files
-
-Before beginning either build process, place the custom compute and dump source files into the LAMMPS source tree.
-
-Copy the following four files into the `src/VORONOI` directory of your LAMMPS installation:
-
-- `compute_ws.cpp`
-- `compute_ws.h`
-- `dump_ws_vac.cpp`
-- `dump_ws_vac.h`
+* **VORONOI Package:** This compute is part of the `VORONOI` package. It is only enabled if LAMMPS was built with that package. See the [LAMMPS Build package](https://docs.lammps.org/Build_package.html) page for build instructions.
+* **Static Processor Domain:** Assumes a static processor domain and simulation box after initialization.
+  * It **cannot** be used in simulations where the simulation box is deformed continuously (e.g., via [`fix deform`](https://docs.lammps.org/fix_deform.html)).
+  * It **cannot** be used with dynamic load balancing (e.g., via [`fix balance`](https://docs.lammps.org/fix_balance.html)), because reference lattice coordinates are frozen on their original MPI ranks.
+  * The compute will throw a runtime error if a simulation box change is detected.
 
 ---
 
-## CMake Build (Recommended)
+## Related Commands
 
-CMake is the primary and recommended build system for modern LAMMPS installations. It handles package dependencies and the downloading of external libraries automatically. From LAMMPS version 10Sep2025, the VORONOI package no longer supports the traditional make build. You need to build LAMMPS with CMake. 
+* [`compute voronoi/atom`](https://docs.lammps.org/compute_voronoi_atom.html)
+* [`dump local`](https://docs.lammps.org/dump.html)
+* [`compute`](https://docs.lammps.org/compute.html)
 
-### 1. Create a build directory
+---
 
-It is best practice to compile LAMMPS in a separate directory outside of the main source tree.
+## Default Values
 
-```bash
-cd lammps
-mkdir build
-cd build
-```
-
-### 2. Configure the build environment
-
-Enable the `VORONOI` package, use the `DOWNLOAD_VORO=yes` flag to instruct CMake to automatically fetch and statically link the correct version of the library.
-
-```bash
-cmake -D PKG_VORONOI=ON -D DOWNLOAD_VORO=yes -D BUILD_MPI=ON ../cmake
-```
-
-You can append any additional CMake flags here depending on your required configuration. Below is an example of building LAMMPS with the custom `compute ws` style for a DGX node equipped with NVIDIA V100 GPUs on the HYBRILIT computing platform at MLIT using the `most.cmake` preset.
-
-```bash
-module load gcc/v12.3.0 cuda/v12.8 openmpi/v4.1.8_gcc1230 CMake/v4.2.3 LAPACK/v3.12.0_gcc1230
-cmake -C ../cmake/presets/most.cmake -D PKG_VORONOI=ON -D DOWNLOAD_VORO=yes -D BUILD_MPI=ON -D PKG_GPU=ON -D GPU_API=cuda -D GPU_ARCH=sm_70 -D PKG_OPENMP=ON -D CMAKE_C_COMPILER=gcc -D CMAKE_CXX_COMPILER=g++ ../cmake
-```
-### 3. Compile the executable
-
-Compile the code using multiple threads to speed up the process.
-
-```bash
-make -j 8
-```
-
-Upon completion, the `lmp` executable will be generated in your `build` directory.
+* **`skin`**: LAMMPS neighbor skin distance (with a minimum of $0.5$ distance units).
