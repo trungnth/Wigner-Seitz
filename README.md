@@ -110,10 +110,10 @@ Calculated for **every** atom in the compute group.
 
 | Column | Property | Description |
 | :---: | :--- | :--- |
-| **1** | **Occupancy** | Number of atoms currently residing in the WS cell where this atom is located |
-| **2** | **SiteIndex** | The MPI-local array index of the WS cell.<br>*(**Note:** This is an internal processor-specific index and is **not** globally unique. For post-processing and visualization, users should rely on `SiteIdentifier` (column 3) instead).* |
-| **3** | **SiteIdentifier** | Original atom ID of the reference atom defining this WS cell |
-| **4** | **SiteType** | Original atom type of the reference atom defining this WS cell |
+| `c_ID[1]` | **Occupancy** | Number of atoms currently residing in the WS cell where this atom is located |
+| `c_ID[2]` | **SiteIndex** | The MPI-local array index of the WS cell.<br>*(**Note:** This is an internal processor-specific index and is **not** globally unique. For post-processing and visualization, users should rely on `SiteIdentifier` (column 3) instead).* |
+| `c_ID[3]` | **SiteIdentifier** | Original atom ID of the reference atom defining this WS cell |
+| `c_ID[4]` | **SiteType** | Original atom type of the reference atom defining this WS cell |
 
 ### 3. Local Array (Vacancy Coordinates)
 
@@ -121,11 +121,11 @@ Outputs the reference coordinates and properties of identified **Vacancies** (em
 
 | Column | Property | Description |
 | :---: | :--- | :--- |
-| **1** | **ID** | Reference atom ID of the vacancy site |
-| **2** | **Type** | Reference atom type of the vacancy site |
-| **3** | **x** | Reference $x$-coordinate of the vacancy site |
-| **4** | **y** | Reference $y$-coordinate of the vacancy site |
-| **5** | **z** | Reference $z$-coordinate of the vacancy site |
+| `c_ID[1]` | **ID** | Reference atom ID of the vacancy site |
+| `c_ID[2]` | **Type** | Reference atom type of the vacancy site |
+| `c_ID[3]` | **x** | Reference $x$-coordinate of the vacancy site |
+| `c_ID[4]` | **y** | Reference $y$-coordinate of the vacancy site |
+| `c_ID[5]` | **z** | Reference $z$-coordinate of the vacancy site |
 
 ---
 
