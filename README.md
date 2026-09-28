@@ -4,18 +4,22 @@ A custom LAMMPS compute command for on-the-fly **Wigner-Seitz (WS) defect analys
 
 ## Table of Contents
 
-* [Syntax](#syntax)
-* [Examples](#examples)
-* [Description](#description)
-  * [Classification of Defects](#classification-of-defects)
-  * [Voronoi Container and Skin Buffer](#voronoi-container-and-skin-buffer)
-* [Output Information](#output-information)
-  * [Global Vector (Defect Tallies)](#1-global-vector-defect-tallies)
-  * [Per-Atom Array (Site Properties)](#2-per-atom-array-site-properties)
-  * [Local Array (Vacancy Coordinates)](#3-local-array-vacancy-coordinates)
-* [Prerequisites & Restrictions](#prerequisites--restrictions)
-* [Related Commands](#related-commands)
-* [Default Values](#default-values)
+- [Syntax](#syntax)
+- [Examples](#examples)
+- [Description](#description)
+  - [Classification of Defects](#classification-of-defects)
+  - [Voronoi Container and Skin](#voronoi-container-and-skin)
+- [Output Information](#output-information)
+  - [1. Global Vector (Defect Tallies)](#1-global-vector-defect-tallies)
+  - [2. Per-Atom Array (Site Properties)](#2-per-atom-array-site-properties)
+  - [3. Local Array (Vacancy Coordinates)](#3-local-array-vacancy-coordinates)
+- [Installation Instructions](#installation-instructions)
+  - [Prerequisites: Positioning Source Files](#prerequisites-positioning-the-source-files)
+  - [CMake Build (Recommended)](#cmake-build-recommended)
+- [Restrictions](#restrictions)
+- [Related Commands](#related-commands)
+- [Default](#default)
+
 
 ---
 
@@ -129,7 +133,76 @@ Outputs the reference coordinates and properties of identified **Vacancies** (em
 
 ---
 
-## Prerequisites & Restrictions
+## Installation Instructions
+
+This custom compute relies on the exact polyhedral cell algorithms provided by the `voro++` library. Therefore the simplest and most straightforward way to compile the custom `compute ws` style is to build LAMMPS with the `VORONOI` package enabled.
+
+### Prerequisites: Positioning the Source Files
+
+Before beginning the build process, place the custom compute source files into the LAMMPS source tree.
+
+Copy the following source files into the `src/VORONOI` directory of your LAMMPS installation:
+
+- `compute_ws.cpp`
+- `compute_ws.h`
+
+---
+
+### CMake Build (Recommended)
+
+CMake is the primary and recommended build system for modern LAMMPS installations. It handles package dependencies and the downloading of external libraries automatically. 
+
+> **Notice:** Starting with LAMMPS version **10Sep2025**, the `VORONOI` package no longer supports traditional GNU make builds. You must build LAMMPS using CMake.
+
+#### 1. Create a build directory
+
+It is best practice to compile LAMMPS in a separate directory outside of the main source tree:
+
+```bash
+cd lammps
+mkdir build
+cd build
+```
+
+#### 2. Configure the build environment
+
+Enable the `VORONOI` package, and use the `-D DOWNLOAD_VORO=yes` flag to instruct CMake to automatically fetch and statically link the correct version of the `voro++` library:
+
+```bash
+cmake -D PKG_VORONOI=ON -D DOWNLOAD_VORO=yes -D BUILD_MPI=ON ../cmake
+```
+
+You can append any additional CMake flags depending on your required configuration. Below is an example of building LAMMPS with `compute ws` for a DGX node equipped with NVIDIA V100 GPUs on the HYBRILIT computing platform at MLIT, JINR using the `most.cmake` preset:
+
+```bash
+module load gcc/v12.3.0 cuda/v12.8 openmpi/v4.1.8_gcc1230 CMake/v4.2.3 LAPACK/v3.12.0_gcc1230
+
+cmake -C ../cmake/presets/most.cmake \
+      -D PKG_VORONOI=ON \
+      -D DOWNLOAD_VORO=yes \
+      -D BUILD_MPI=ON \
+      -D PKG_GPU=ON \
+      -D GPU_API=cuda \
+      -D GPU_ARCH=sm_70 \
+      -D PKG_OPENMP=ON \
+      -D CMAKE_C_COMPILER=gcc \
+      -D CMAKE_CXX_COMPILER=g++ \
+      ../cmake
+```
+
+#### 3. Compile the executable
+
+Compile the code using multiple threads to accelerate the build:
+
+```bash
+make -j 8
+```
+
+Upon successful completion, the `lmp` executable will be generated in your `build` directory.
+
+---
+
+## Restrictions
 
 * **VORONOI Package:** This compute is part of the `VORONOI` package. It is only enabled if LAMMPS was built with that package. See the [LAMMPS Build package](https://docs.lammps.org/Build_package.html) page for build instructions.
 * **Static Processor Domain:** Assumes a static processor domain and simulation box after initialization.
