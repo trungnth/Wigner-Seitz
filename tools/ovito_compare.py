@@ -41,7 +41,8 @@ Example (files of a LAMMPS run, see README.md):
   python3 ovito_compare.py --reference ref.dump --current final.dump.gz \\
       --defects defects.dump --vacancies vacancies.dump --log log.lammps
 
-Requires the OVITO Python module (pip install ovito) and NumPy.
+Requires the OVITO Python module (pip install ovito) and NumPy. For more information: 
+https://www.ovito.org/docs/current/python/introduction/getting_started/installation.html
 """
 
 import argparse
