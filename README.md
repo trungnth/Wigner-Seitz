@@ -1,4 +1,4 @@
-# compute ws: Wigner-Seitz point-defect analysis for LAMMPS
+# compute ws: Wigner-Seitz defect analysis for LAMMPS
 
 `compute ws` identifies point defects in LAMMPS simulations, such as
 displacement cascades, by a Wigner-Seitz analysis relative to a reference
