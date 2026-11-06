@@ -10,9 +10,10 @@ configuration. In one invocation it gives:
 
 The reference is either the group atoms at the start of the run or a dump
 file. With `affine yes` the box may change size and shape, e.g. under
-NPT. The compute needs no external library and communicates only five
-integers per invocation. Its results agree exactly with the Wigner-Seitz
-modifier of OVITO.
+NPT. The compute needs no external library. Between MPI processes it
+exchanges only one sum of five integer counters per invocation,
+whatever the number of atoms. Its results agree exactly with the
+Wigner-Seitz modifier of OVITO.
 
 ## Contents
 
@@ -61,7 +62,8 @@ The nearest site is found exactly; no cells are constructed:
 
 Each MPI rank keeps the sites of its local and ghost atoms only. Defects
 are classified on the sites it owns, and the counts are summed in one
-`MPI_Allreduce` of five integers.
+`MPI_Allreduce` of five 64-bit integer counters (40 bytes), whatever the
+number of atoms.
 
 ## Requirements
 
