@@ -67,8 +67,7 @@ number of atoms.
 
 ## Requirements
 
-- LAMMPS 30 Sep 2026 (stable release) or a newer development version,
-  built with the EXTRA-COMPUTE package.
+- LAMMPS built with the EXTRA-COMPUTE package (tested on LAMMPS 30 Sep 2026 (stable release))
 - For the example: the MANYBODY package (pair style `gw/zbl`).
 - For `tools/ovito_compare.py`: Python 3 with NumPy and the OVITO Python
   module (`pip install ovito`).
