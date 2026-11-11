@@ -14,7 +14,8 @@
 #
 # Output:
 #   thermo              interstitials, vacancies, replacements, antisites,
-#                       and the number of atoms written to defects.*.dump
+#                       the number of atoms written to defects.*.dump, and
+#                       the translation of the crystal (drift yes, see below)
 #   vacancies.*.dump    dump local: one line per vacant site
 #   defects.*.dump      dump custom: only atoms whose site differs from the
 #                       reference (interstitial configurations, antisites,
@@ -62,27 +63,36 @@ group           border subtract all inner
 # Defined before the first run: the perfect lattice above becomes the
 # reference configuration at the beginning of that run.
 #
+# drift yes: the PKA velocity below is added to the thermal velocities
+# (sum yes), so the whole crystal moves along [1 2 3] with the momentum of
+# the PKA, by about 0.3 A until the end of the run.  The compute follows
+# this translation instead of counting atoms near the faces of their sites
+# as displaced.
+#
 # global vector   c_ws_map[1..4]  interstitials, vacancies, replacements,
 #                                 antisites
+#                 c_ws_map[5..7]  translation of the crystal (drift yes)
 # per-atom array  c_ws_map[1..3]  occupancy, site ID, site type
 # local array     c_ws_map[1..5]  site ID, site type, x, y, z of each
-#                                 vacant site
+#                                 vacant site (moved with the crystal)
 #
 # Other references: "reference ref.dump" reads the sites from a dump file,
 # "affine yes" removes a homogeneous deformation of the box (fix npt).
 # ------------------------------------------------------------------------
 
-compute         ws_map all ws
+compute         ws_map all ws drift yes
 
 # an atom is part of a defect if it shares its site with other atoms,
 # occupies another atom's site, or has a different type than its site
 variable        def atom "(c_ws_map[1] >= 2) || (id != c_ws_map[2]) || (type != c_ws_map[3])"
 compute         ndef all reduce sum v_def
 
-thermo_style    custom step time dt temp pe c_ws_map[1] c_ws_map[2] c_ws_map[3] c_ws_map[4] c_ndef
+thermo_style    custom step time dt temp pe c_ws_map[1] c_ws_map[2] c_ws_map[3] c_ws_map[4] c_ndef &
+                c_ws_map[5] c_ws_map[6] c_ws_map[7]
 thermo_modify   colname c_ws_map[1] Interstitials colname c_ws_map[2] Vacancies &
                 colname c_ws_map[3] Replacements colname c_ws_map[4] Antisites &
-                colname c_ndef DefectAtoms
+                colname c_ndef DefectAtoms colname c_ws_map[5] DriftX &
+                colname c_ws_map[6] DriftY colname c_ws_map[7] DriftZ
 thermo          100
 
 dump            defects all custom 1500 defects.*.dump id type x y z &

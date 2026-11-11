@@ -39,7 +39,7 @@
      of its local atoms (index-based ownership, also valid for triclinic
      boxes). Occupancies are accumulated from local and ghost atoms, defects
      are classified on owned sites only, and all counters are summed by a
-     single integer MPI_Allreduce().
+     single integer MPI_Allreduce() per assignment.
    - A reference file is read by rank 0 in chunks and broadcast. Each rank
      keeps the sites inside its sub-domain extended by the ghost cutoff, in
      fractional coordinates and with periodic images, and owns those inside
@@ -58,6 +58,37 @@
      changed number of local atoms is an error.
    - Internal check (not an output): the site occupancies must add up to the
      number of group atoms, otherwise a warning is printed once per reference.
+   - drift keyword: the crystal can move as a whole relative to the box,
+     e.g. by the momentum of a primary knock-on atom, by a thermostat, or by
+     the mass that migrating defects carry while the center of mass stays
+     fixed. Its translation t is a weighted mean displacement of the atoms
+     from their sites (an M-estimate of location with a smooth, redescending
+     weight): weight 1 closer than r_min/4 to the site, falling smoothly to
+     0 at r_min/2, w = 1 - v^2 (3 - 2v) with v = 4 r / r_min - 1. Farther
+     atoms (interstitials, displaced atoms of a cascade) do not count. An
+     atom closer than r_min/2 to a site certainly belongs to it, so the
+     weighted mean changes continuously with t and with the positions. A
+     plain mean over the atoms alone on a site would change in steps, and an
+     atom within about r_min/N of a cell face could then make two
+     translations self-consistent.
+   - The sums of the weights and of the weighted displacements are 64-bit
+     integers, in units of 2^-27 and of 2^-27 times the largest power of two
+     not above r_min/2 (fewer bits above 2^34 atoms, so that they cannot
+     overflow). Each atom is counted on the rank that owns its site, and the
+     sums travel in the same MPI_Allreduce() as the defect counters, so t is
+     the same on every rank and for any number of ranks.
+   - drift yes: atoms are assigned at x - t (after the affine mapping),
+     starting with t of the previous analysis. t is corrected by the
+     weighted mean displacement of the current assignment and the atoms are
+     assigned again (iteratively reweighted), until the correction is below
+     1e-6 r_min/2. After a correction, an atom closer than r_min/2 to its
+     previous site keeps it; only the other atoms are searched again. The
+     counters, per-atom values and vacancies are those of the last
+     assignment, with the vacancies at the moved site positions. t is kept in
+     an internal fix STORE/GLOBAL, so that a reference file used after a
+     restart continues with the stored t.
+   - drift no: every 16th atom (by ID) measures t, only for a warning that is
+     printed once if t exceeds 25% of r_min/2.
 ------------------------------------------------------------------------- */
 
 #include "compute_ws.h"
@@ -66,9 +97,12 @@
 #include "comm.h"
 #include "domain.h"
 #include "error.h"
+#include "fix_store_global.h"
+#include "group.h"
 #include "math_const.h"
 #include "math_extra.h"
 #include "memory.h"
+#include "modify.h"
 #include "neighbor.h"
 #include "reader_native.h"
 #include "update.h"
@@ -88,8 +122,17 @@ using MathConst::MY_PI;
 namespace {
 
 enum { INTERSTITIALS = 0, VACANCIES, REPLACEMENTS, ANTISITES, NVECTOR };
-enum { UNACCOUNTED = NVECTOR, NCOUNTER };
+enum { UNACCOUNTED = NVECTOR, WEIGHT, SUMX, SUMY, SUMZ, NCOUNTER };
 enum { BOX_CHANGED = 1, SUBDOMAIN_CHANGED = 2 };
+
+constexpr int NDRIFT = 3;               // translation components in the global vector
+constexpr int DRIFT_BITS = 27;          // fixed-point bits of the translation sums
+constexpr int DRIFT_MAXITER = 10;       // most assignments in one analysis (drift yes)
+constexpr double DRIFT_EPS = 1.0e-6;    // translation converged below this * r_min/2
+constexpr double DRIFT_CORE = 0.5;      // full weight below this * r_min/2
+constexpr double DRIFT_WARN = 0.25;     // warning (drift no) above this * r_min/2
+constexpr double DRIFT_JUMP = 0.5;      // warning (drift yes) above this * r_min/2
+constexpr int DRIFT_SAMPLE = 16;        // drift no: one atom in this many (by ID) measures t
 
 constexpr int NPERATOM = 3;
 constexpr int NLOCAL = 5;
@@ -160,12 +203,14 @@ void file_box(const double box[3][3], int triclinic, double *lo, double *h)
 /* ---------------------------------------------------------------------- */
 
 ComputeWS::ComputeWS(LAMMPS *lmp, int narg, char **arg) :
-    Compute(lmp, narg, arg), reffile(nullptr), affine_flag(0), nref(0), nref_owned(0), maxref(0),
-    xref(nullptr), tagref(nullptr), typeref(nullptr), nsites(0), ref_stored(false),
-    occupancy(nullptr), occupant(nullptr), nmax(0), site_of_atom(nullptr), peratom(nullptr),
-    nvacancy(0), maxvacancy(0), vacancy(nullptr), analyzed_step(-1), peratom_step(-1),
-    analyzed_nlocal(0), cutoff_warned(0), unaccounted_warned(0), rcertsq(0.0), binsize(1.0),
-    bininv(1.0), nbins(0), maxbins(0), binstart(nullptr), binsite(nullptr), xbin(nullptr)
+    Compute(lmp, narg, arg), reffile(nullptr), affine_flag(0), drift_flag(0), drift_margin(BIG),
+    rcert_all(0.0), drift_warned(0), jump_warned(0), converge_warned(0), margin_warned(0),
+    id_fix(nullptr), fix_drift(nullptr), nref(0), nref_owned(0), maxref(0), xref(nullptr),
+    tagref(nullptr), typeref(nullptr), nsites(0), ref_stored(false), occupancy(nullptr),
+    occupant(nullptr), nmax(0), site_of_atom(nullptr), peratom(nullptr), nvacancy(0), maxvacancy(0),
+    vacancy(nullptr), analyzed_step(-1), peratom_step(-1), analyzed_nlocal(0), cutoff_warned(0),
+    unaccounted_warned(0), rcertsq(0.0), binsize(1.0), bininv(1.0), nbins(0), maxbins(0),
+    binstart(nullptr), binsite(nullptr), xbin(nullptr)
 {
   if (atom->tag_enable == 0) error->all(FLERR, "Compute ws requires atom IDs");
 
@@ -180,6 +225,10 @@ ComputeWS::ComputeWS(LAMMPS *lmp, int narg, char **arg) :
       if (iarg + 2 > narg) utils::missing_cmd_args(FLERR, "compute ws affine", error);
       affine_flag = utils::logical(FLERR, arg[iarg + 1], false, lmp);
       iarg += 2;
+    } else if (strcmp(arg[iarg], "drift") == 0) {
+      if (iarg + 2 > narg) utils::missing_cmd_args(FLERR, "compute ws drift", error);
+      drift_flag = utils::logical(FLERR, arg[iarg + 1], false, lmp);
+      iarg += 2;
     } else {
       error->all(FLERR, iarg, "Unknown compute ws keyword: {}", arg[iarg]);
     }
@@ -192,12 +241,22 @@ ComputeWS::ComputeWS(LAMMPS *lmp, int narg, char **arg) :
   }
   for (int k = 0; k < 6; k++) ref_h[k] = ref_split[k] = map_h[k] = 0.0;
   ref_cutoff = 0.0;
+  for (int d = 0; d < 3; d++) drift[d] = drift_used[d] = 0.0;
 
   dynamic_group_allow = 0;
 
   vector_flag = 1;
-  size_vector = NVECTOR;
+  size_vector = drift_flag ? NVECTOR + NDRIFT : NVECTOR;
   extvector = 0;
+
+  // internal fix that stores the translation (x, y, z, set flag) in restart files;
+  // created now so that a restart file can restore it
+
+  if (drift_flag) {
+    id_fix = utils::strdup(std::string(id) + "_COMPUTE_STORE");
+    fix_drift = dynamic_cast<FixStoreGlobal *>(
+        modify->add_fix(fmt::format("{} {} STORE/GLOBAL 4 1", id_fix, group->names[igroup])));
+  }
 
   peratom_flag = 1;
   size_peratom_cols = NPERATOM;
@@ -214,6 +273,8 @@ ComputeWS::ComputeWS(LAMMPS *lmp, int narg, char **arg) :
 
 ComputeWS::~ComputeWS()
 {
+  if (id_fix && modify->get_fix_by_id(id_fix)) modify->delete_fix(id_fix);
+  delete[] id_fix;
   delete[] reffile;
   memory->destroy(vector);
 
@@ -253,6 +314,12 @@ void ComputeWS::init()
     error->warning(FLERR,
                    "Compute ws with 'affine yes' does not support box flips; use 'flip no' "
                    "if the box tilt can change");
+
+  if (drift_flag) {
+    fix_drift = dynamic_cast<FixStoreGlobal *>(modify->get_fix_by_id(id_fix));
+    if (!fix_drift)
+      error->all(FLERR, Error::NOLASTLINE, "Could not find compute ws fix with ID {}", id_fix);
+  }
 }
 
 /* ----------------------------------------------------------------------
@@ -270,6 +337,7 @@ void ComputeWS::setup()
     else
       store_reference();
     build_container();
+    reset_drift();
   } else {
     check_reference();
   }
@@ -651,15 +719,27 @@ void ComputeWS::Sites::add(const double *xs, tagint id, int itype)
 
 /* ----------------------------------------------------------------------
    build the cell list of the stored sites and compute the radius of the
-   nearest-site test
+   nearest-site test, on this rank and (for the translation) on all ranks
 ------------------------------------------------------------------------- */
 
 void ComputeWS::build_container()
 {
   nbins = 0;
   rcertsq = 0.0;
-  if (nref == 0) return;
+  if (nref > 0) build_bins();
 
+  double rcertsq_me = (nref > 0) ? rcertsq : BIG;
+  double rcertsq_all = BIG;
+  MPI_Allreduce(&rcertsq_me, &rcertsq_all, 1, MPI_DOUBLE, MPI_MIN, world);
+  rcert_all = (rcertsq_all < BIG) ? sqrt(rcertsq_all) : 0.0;
+}
+
+/* ----------------------------------------------------------------------
+   cell list of the stored sites and radius of the nearest-site test
+------------------------------------------------------------------------- */
+
+void ComputeWS::build_bins()
+{
   double lo[3], hi[3], len[3];
   for (int d = 0; d < 3; d++) lo[d] = hi[d] = xref[0][d];
   for (int s = 1; s < nref; s++) {
@@ -724,12 +804,37 @@ void ComputeWS::build_container()
 }
 
 /* ----------------------------------------------------------------------
+   translation of a new reference: zero, or with a reference file the
+   translation that a restart file stored in the internal fix
+------------------------------------------------------------------------- */
+
+void ComputeWS::reset_drift()
+{
+  for (int d = 0; d < 3; d++) drift[d] = drift_used[d] = 0.0;
+  drift_warned = jump_warned = converge_warned = margin_warned = 0;
+  if (!drift_flag) return;
+
+  double *store = fix_drift->vstore;
+  if (reffile && (store[3] == 1.0)) {
+    for (int d = 0; d < 3; d++) drift[d] = drift_used[d] = store[d];
+    if (comm->me == 0)
+      utils::logmesg(lmp,
+                     "Compute ws {}: translation ({:.8g}, {:.8g}, {:.8g}) of the crystal "
+                     "taken from the restart file\n",
+                     id, drift[0], drift[1], drift[2]);
+  }
+  for (int d = 0; d < 3; d++) store[d] = drift[d];
+  store[3] = 1.0;
+}
+
+/* ----------------------------------------------------------------------
    warn once if the ghost shell may be too thin for boundary sites
 ------------------------------------------------------------------------- */
 
 void ComputeWS::check_ghost_cutoff()
 {
-  if (cutoff_warned || (nsites == 0)) return;
+  drift_margin = BIG;
+  if (nsites == 0) return;
 
   if ((comm->nprocs == 1) && !domain->xperiodic && !domain->yperiodic && !domain->zperiodic) return;
 
@@ -737,8 +842,9 @@ void ComputeWS::check_ghost_cutoff()
   const double rws = std::cbrt(3.0 * volume / (4.0 * MY_PI * (double) nsites));
   const double needed = 2.0 * rws + 0.5 * neighbor->skin;
   const double cutcomm = comm->get_comm_cutoff();
+  drift_margin = cutcomm - needed;
 
-  if (cutcomm < needed) {
+  if (!cutoff_warned && (cutcomm < needed)) {
     cutoff_warned = 1;
     if (comm->me == 0)
       error->warning(FLERR,
@@ -1013,6 +1119,7 @@ void ComputeWS::analyze()
     else
       store_reference();
     build_container();
+    reset_drift();
   } else if (update->setupflag) {
     check_reference();
   }
@@ -1038,41 +1145,32 @@ void ComputeWS::analyze()
   int *type = atom->type;
   int *mask = atom->mask;
 
-  bigint one[NCOUNTER] = {};
-
-  if (nref > 0) std::fill_n(occupancy, nref, 0);
-
   double m[6], c[3], minv[6], cinv[3];
   const int mapped = affine_flag ? box_map(m, c, minv, cinv) : 0;
 
-  const bool allgroup = (igroup == 0);
-  int snext = 0;
-  int slast = 0;
-  for (int i = 0; i < nall; i++) {
-    site_of_atom[i] = -1;
-    if (!allgroup && !(mask[i] & groupbit)) continue;
+  // position at which the site of atom i is sought: mapped into the box of the
+  // reference (affine yes) and moved back by the translation of the crystal (drift yes)
 
-    double xm[3];
-    const double *xi = x[i];
+  double shift[3] = {0.0, 0.0, 0.0};
+  if (drift_flag)
+    for (int d = 0; d < 3; d++) shift[d] = drift[d];
+  const bool moved = mapped || drift_flag;
+  auto position = [&](int i, double *xm) -> const double * {
+    if (!moved) return x[i];
     if (mapped) {
       triangular_apply(m, c, x[i], xm);
-      xi = xm;
-    }
-
-    int s = guess_site(xi, tag[i], snext, slast);
-    if (s >= 0) {
-      snext = s + 1;
     } else {
-      s = find_site(xi);
-      if (s < 0) continue;
-      slast = s + 1;
+      xm[0] = x[i][0];
+      xm[1] = x[i][1];
+      xm[2] = x[i][2];
     }
+    xm[0] -= shift[0];
+    xm[1] -= shift[1];
+    xm[2] -= shift[2];
+    return xm;
+  };
 
-    site_of_atom[i] = s;
-    occupancy[s]++;
-    occupant[s] = i;
-  }
-
+  const bool allgroup = (igroup == 0);
   bigint ngroup = nlocal;
   if (!allgroup) {
     ngroup = 0;
@@ -1080,55 +1178,235 @@ void ComputeWS::analyze()
       if (mask[i] & groupbit) ngroup++;
   }
 
-  bigint nassigned = 0;
-  nvacancy = 0;
-  for (int s = 0; s < nref_owned; s++) {
-    const int occ = occupancy[s];
-    nassigned += occ;
+  // weight of an atom in the translation: 1 closer than r_min/4 to its site, falling
+  // smoothly to 0 at r_min/2 (such an atom certainly belongs to that site). The sums
+  // are 64-bit integers, with fewer fixed-point bits for very large systems so that
+  // they cannot overflow. Without the drift keyword they serve only the warning, and
+  // only every DRIFT_SAMPLE-th atom (by ID) contributes.
 
-    if (occ == 0) {
-      if (nvacancy == maxvacancy) {
-        maxvacancy += DELTA;
-        memory->grow(vacancy, maxvacancy, NLOCAL, "ws:vacancy");
+  const bool measure = drift_flag || !drift_warned;
+  const double rcsq = rcert_all * rcert_all;
+  const double rcoresq = DRIFT_CORE * DRIFT_CORE * rcsq;
+  int bits = DRIFT_BITS;
+  while ((bits > 1) && (atom->natoms > (MAXBIGINT >> (bits + 2)))) bits--;
+  const double weight_scale = std::ldexp(1.0, bits);
+  const double sum_scale = (rcert_all > 0.0) ? std::ldexp(1.0, bits - std::ilogb(rcert_all)) : 0.0;
+  const double tolerance = std::max(DRIFT_EPS, std::ldexp(4.0, -bits)) * rcert_all;
+
+  bigint one[NCOUNTER];
+  bigint all[NCOUNTER];
+
+  // add the weighted displacement of an atom at xi from its site s if this rank owns s,
+  // so that every atom is counted once (rounded toward zero in fixed point)
+
+  auto add_weighted = [&](int s, const double *xi) {
+    if ((s < 0) || (s >= nref_owned)) return;
+    const double dx = xi[0] - xref[s][0];
+    const double dy = xi[1] - xref[s][1];
+    const double dz = xi[2] - xref[s][2];
+    const double rsq = dx * dx + dy * dy + dz * dz;
+    if (rsq >= rcsq) return;
+    double w = 1.0;
+    if (rsq > rcoresq) {
+      const double v = (sqrt(rsq) / rcert_all - DRIFT_CORE) / (1.0 - DRIFT_CORE);
+      w = 1.0 - v * v * (3.0 - 2.0 * v);
+    }
+    one[WEIGHT] += static_cast<bigint>(w * weight_scale);
+    one[SUMX] += static_cast<bigint>(w * dx * sum_scale);
+    one[SUMY] += static_cast<bigint>(w * dy * sum_scale);
+    one[SUMZ] += static_cast<bigint>(w * dz * sum_scale);
+  };
+
+  double residual[3] = {0.0, 0.0, 0.0};
+  double rlen = 0.0;
+
+  for (int iter = 1;; iter++) {
+    std::fill_n(one, NCOUNTER, 0);
+    if (nref > 0) std::fill_n(occupancy, nref, 0);
+
+    if (iter == 1) {
+
+      // first assignment: guess from the order of the sites, else exact search
+
+      int snext = 0;
+      int slast = 0;
+      for (int i = 0; i < nall; i++) {
+        site_of_atom[i] = -1;
+        if (!allgroup && !(mask[i] & groupbit)) continue;
+
+        double xm[3];
+        const double *xi = position(i, xm);
+
+        int s = guess_site(xi, tag[i], snext, slast);
+        if (s >= 0) {
+          snext = s + 1;
+        } else {
+          s = find_site(xi);
+          if (s < 0) continue;
+          slast = s + 1;
+        }
+
+        site_of_atom[i] = s;
+        occupancy[s]++;
+        occupant[s] = i;
+        if (measure && (drift_flag || (tag[i] % DRIFT_SAMPLE == 0))) add_weighted(s, xi);
       }
-      double *row = vacancy[nvacancy++];
-      row[0] = tagref[s];
-      row[1] = typeref[s];
-      if (mapped) {
-        triangular_apply(minv, cinv, xref[s], &row[2]);
-      } else {
-        row[2] = xref[s][0];
-        row[3] = xref[s][1];
-        row[4] = xref[s][2];
-      }
+
     } else {
-      one[INTERSTITIALS] += occ - 1;
 
-      if (occ == 1) {
-        const int i = occupant[s];
-        if (tag[i] != tagref[s]) one[REPLACEMENTS]++;
-        if (type[i] != typeref[s]) one[ANTISITES]++;
+      // assignment with the corrected translation: an atom closer than r_min/2 to
+      // its previous site keeps it, all others are searched again
+
+      for (int i = 0; i < nall; i++) {
+        if (!allgroup && !(mask[i] & groupbit)) continue;
+
+        double xm[3];
+        const double *xi = position(i, xm);
+
+        int s = site_of_atom[i];
+        if (s >= 0) {
+          const double dx = xi[0] - xref[s][0];
+          const double dy = xi[1] - xref[s][1];
+          const double dz = xi[2] - xref[s][2];
+          if (dx * dx + dy * dy + dz * dz >= rcertsq) s = find_site(xi);
+        } else {
+          s = find_site(xi);
+        }
+
+        site_of_atom[i] = s;
+        if (s < 0) continue;
+        occupancy[s]++;
+        occupant[s] = i;
+        add_weighted(s, xi);
       }
     }
+
+    bigint nassigned = 0;
+    nvacancy = 0;
+    for (int s = 0; s < nref_owned; s++) {
+      const int occ = occupancy[s];
+      nassigned += occ;
+
+      if (occ == 0) {
+        if (nvacancy == maxvacancy) {
+          maxvacancy += DELTA;
+          memory->grow(vacancy, maxvacancy, NLOCAL, "ws:vacancy");
+        }
+        double *row = vacancy[nvacancy++];
+        row[0] = tagref[s];
+        row[1] = typeref[s];
+        const double xs[3] = {xref[s][0] + shift[0], xref[s][1] + shift[1], xref[s][2] + shift[2]};
+        if (mapped) {
+          triangular_apply(minv, cinv, xs, &row[2]);
+        } else {
+          row[2] = xs[0];
+          row[3] = xs[1];
+          row[4] = xs[2];
+        }
+      } else {
+        one[INTERSTITIALS] += occ - 1;
+
+        if (occ == 1) {
+          const int i = occupant[s];
+          if (tag[i] != tagref[s]) one[REPLACEMENTS]++;
+          if (type[i] != typeref[s]) one[ANTISITES]++;
+        }
+      }
+    }
+    one[VACANCIES] = nvacancy;
+    one[UNACCOUNTED] = ngroup - nassigned;
+
+    MPI_Allreduce(one, all, NCOUNTER, MPI_LMP_BIGINT, MPI_SUM, world);
+
+    // weighted mean displacement = translation of the crystal that the shift of this
+    // assignment does not yet contain
+
+    double rsq = 0.0;
+    for (int d = 0; d < 3; d++) {
+      residual[d] = 0.0;
+      if (all[WEIGHT] > 0)
+        residual[d] = (double) all[SUMX + d] * weight_scale / ((double) all[WEIGHT] * sum_scale);
+      rsq += residual[d] * residual[d];
+    }
+    rlen = sqrt(rsq);
+
+    if (!drift_flag) break;
+
+    if ((iter == 1) && !jump_warned && (nsites > 0)) {
+      if (all[WEIGHT] == 0) {
+        jump_warned = 1;
+        if (comm->me == 0)
+          error->warning(FLERR,
+                         "Compute ws: no atom is closer than half the shortest distance "
+                         "between sites to a site at step {}, so the translation of the crystal "
+                         "cannot be followed; invoke the compute more often",
+                         update->ntimestep);
+      } else if (rlen > DRIFT_JUMP * rcert_all) {
+        jump_warned = 1;
+        if (comm->me == 0)
+          error->warning(
+              FLERR,
+              "Compute ws: the crystal moved by {:.6g} since the previous analysis "
+              "at step {}; atoms are matched with the wrong sites if it moved by more than "
+              "half the shortest distance between sites, so invoke the compute more often",
+              rlen, update->ntimestep);
+      }
+    }
+    if (rlen <= tolerance) break;
+    if (iter == DRIFT_MAXITER) {
+      if (!converge_warned) {
+        converge_warned = 1;
+        if (comm->me == 0)
+          error->warning(FLERR,
+                         "Compute ws: the translation of the crystal did not converge in {} "
+                         "assignments at step {}",
+                         DRIFT_MAXITER, update->ntimestep);
+      }
+      break;
+    }
+    for (int d = 0; d < 3; d++) shift[d] += residual[d];
   }
-  one[VACANCIES] = nvacancy;
-  one[UNACCOUNTED] = ngroup - nassigned;
 
   array_local = vacancy;
   size_local_rows = nvacancy;
 
-  bigint all[NCOUNTER];
-  MPI_Allreduce(one, all, NCOUNTER, MPI_LMP_BIGINT, MPI_SUM, world);
-
   for (int k = 0; k < NVECTOR; k++) vector[k] = (double) all[k];
+
+  if (drift_flag) {
+    for (int d = 0; d < 3; d++) {
+      drift_used[d] = shift[d];
+      drift[d] = shift[d] + residual[d];
+      vector[NVECTOR + d] = drift_used[d];
+      fix_drift->vstore[d] = drift[d];
+    }
+    fix_drift->vstore[3] = 1.0;
+
+    const double dlen = sqrt(drift[0] * drift[0] + drift[1] * drift[1] + drift[2] * drift[2]);
+    if (!margin_warned && (dlen > drift_margin)) {
+      margin_warned = 1;
+      if (comm->me == 0)
+        error->warning(FLERR,
+                       "Compute ws: the translation {:.6g} of the crystal exceeds the margin "
+                       "{:.6g} of the communication cutoff; increase it with comm_modify cutoff",
+                       dlen, drift_margin);
+    }
+  } else if (!drift_warned && (rlen > DRIFT_WARN * rcert_all)) {
+    drift_warned = 1;
+    if (comm->me == 0)
+      error->warning(FLERR,
+                     "Compute ws: the crystal is displaced from the reference sites by "
+                     "{:.6g} at step {} ({:.0f}% of half the shortest distance between sites); "
+                     "a drift of the crystal produces false Frenkel pairs, see the drift keyword",
+                     rlen, update->ntimestep, 100.0 * rlen / rcert_all);
+  }
 
   const bigint unaccounted = all[UNACCOUNTED];
   if ((unaccounted != 0) && !unaccounted_warned) {
     unaccounted_warned = 1;
     if (comm->me == 0)
       error->warning(FLERR,
-                     "Compute ws: site occupancies differ from the number of group atoms by {}; "
-                     "increase the communication cutoff or remove atoms far from all sites",
+                     "Compute ws: site occupancies differ from the number of group atoms by "
+                     "{}; increase the communication cutoff or remove atoms far from all sites",
                      unaccounted);
   }
 }

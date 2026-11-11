@@ -13,7 +13,7 @@ Syntax
 * ID, group-ID are documented in :doc:`compute <compute>` command
 * ws = style name of this compute command
 * zero or more keyword/value pairs may be appended
-* keyword = *reference* or *affine*
+* keyword = *reference* or *affine* or *drift*
 
   .. parsed-literal::
 
@@ -22,6 +22,9 @@ Syntax
        *affine* value = *yes* or *no*
          *yes* = map the positions into the box of the reference
          *no* = require the box of the reference
+       *drift* value = *yes* or *no*
+         *yes* = follow a rigid translation of the crystal
+         *no* = keep the sites in place
 
 Examples
 """"""""
@@ -31,6 +34,7 @@ Examples
    compute 1 all ws
    compute 2 metal ws affine yes
    compute 3 all ws reference ref.dump affine yes
+   compute 4 all ws drift yes
 
    compute ws all ws
    thermo_style custom step temp c_ws[1] c_ws[2] c_ws[3] c_ws[4]
@@ -112,7 +116,10 @@ The reference is stored at the start of the first run or minimization
 after the compute is defined.  With :doc:`rerun <rerun>`, it is the
 first snapshot.  The reference should be a defect-free crystal, e.g.
 created with :doc:`create_atoms <create_atoms>` or relaxed with
-:doc:`minimize <minimize>`.  A new reference is stored by defining the
+:doc:`minimize <minimize>`.  A crystal with extended defects, such as
+dislocations, should be its own relaxed initial configuration rather
+than a perfect lattice; the compute then reports the defects formed
+since, but it does not follow the extended defects when they move.  A new reference is stored by defining the
 compute again with the same ID (:doc:`uncompute <uncompute>`, then
 *compute*); thermo output, dumps, and variables that use the compute
 need no change.
@@ -175,6 +182,47 @@ flip is missed if the tilt also changed continuously by about half a
 box length in between.  LAMMPS therefore warns when the tilt can change
 during a run with *affine* = *yes*; use *flip no* in that case.
 
+With *drift* = *yes*, the compute follows a rigid translation of the
+crystal relative to its reference.  Such a drift arises, e.g., from the
+momentum of a primary knock-on atom that is not compensated, from a
+thermostat that does not conserve the total momentum, or from defects
+that migrate while the center of mass stays fixed :ref:`(Wang)
+<ws-Wang>`.  Without the keyword, a drift by a sizable fraction of the
+distance between sites produces false Frenkel pairs, because atoms near
+the faces of their WS cells are assigned to neighboring sites.  The
+translation :math:`\vec{t}` is measured at every analysis as a weighted
+mean of the displacements of the atoms from their sites: an atom closer
+than :math:`r_\mathrm{min}/4` to its site has weight 1, the weight falls
+smoothly to 0 at :math:`r_\mathrm{min}/2`, and farther atoms, such as
+interstitials and the displaced atoms of a cascade, do not count
+(:math:`r_\mathrm{min}` is the smallest distance between two sites).
+The atoms are assigned at :math:`\vec{x} - \vec{t}`, starting from the
+translation of the previous analysis, and the translation is corrected
+until it changes by less than :math:`10^{-6}\,r_\mathrm{min}/2`.  The
+result is the same for a rigidly moved copy of the crystal and on any
+number of processors.  The translation is added to the global vector,
+and the vacancies are reported at the moved sites.  With *affine* =
+*yes*, the translation is measured in the box of the reference, after
+the mapping.
+
+The crystal must move by less than :math:`r_\mathrm{min}/2` between two
+analyses, so the compute must be invoked often enough, e.g. by the
+thermo output; LAMMPS warns if it moved by more than
+:math:`r_\mathrm{min}/4` since the previous analysis.  The communication
+cutoff must exceed the cutoff needed for the sites (see below) by the
+accumulated translation; LAMMPS warns otherwise, and :doc:`comm_modify
+cutoff <comm_modify>` can increase it.  Only a translation is followed,
+neither a rotation of the crystal nor local motions of the lattice,
+e.g. near moving dislocations or grain boundaries.  The translation is
+stored in :doc:`restart files <restart>`: a compute with the same ID
+that reads its sites from the same reference file continues with the
+stored translation, whereas sites taken from the atoms define a new
+reference at the start of the restarted job, with zero translation.
+
+With *drift* = *no*, the translation is estimated from every 16th atom
+(by ID), only for a warning that is printed once when it exceeds 25% of
+:math:`r_\mathrm{min}/2`.
+
 Only group atoms are used, both as sites and as occupants.  A single
 sublattice can thus be analyzed with a group defined by atom type.
 
@@ -228,9 +276,9 @@ between runs, e.g. by :doc:`change_box <change_box>`, is an error.
 Output info
 """""""""""
 
-This compute calculates a global vector of length 4, a per-atom array
-with 3 columns, and a local array with 5 columns, all in the same
-invocation.  ``c_ID[I]`` refers to the global vector in
+This compute calculates a global vector of length 4 (7 with *drift* =
+*yes*), a per-atom array with 3 columns, and a local array with 5
+columns, all in the same invocation.  ``c_ID[I]`` refers to the global vector in
 :doc:`thermo_style <thermo_style>` and equal-style variables, to the
 per-atom array in :doc:`dump custom <dump>` and atom-style variables,
 and to the local array in :doc:`dump local <dump>`.  See the
@@ -244,6 +292,12 @@ of atoms):
 #. vacancies
 #. replacements
 #. antisites
+#. x component of the translation (*drift* = *yes* only)
+#. y component of the translation (*drift* = *yes* only)
+#. z component of the translation (*drift* = *yes* only)
+
+The translation is the one used by the analysis, in distance
+:doc:`units <units>`.
 
 If every group atom is assigned to a site, :math:`N_\mathrm{int} -
 N_\mathrm{vac} = N_\mathrm{group} - N_\mathrm{sites}`.  Without added
@@ -269,7 +323,8 @@ element 2.  The values are:
 
 Coordinates are in distance :doc:`units <units>`; all other values are
 counts or IDs.  With *affine* = *yes*, the coordinates are those of the
-site mapped into the current box.
+site mapped into the current box.  With *drift* = *yes*, they are those
+of the site moved by the translation.
 
 Restrictions
 """"""""""""
@@ -297,7 +352,7 @@ Default
 """""""
 
 The option defaults are no reference file (the group atoms at the start
-of the first run) and affine = no.
+of the first run), affine = no, and drift = no.
 
 ----------
 
@@ -311,3 +366,8 @@ J Nucl Mater, 512, 450-479 (2018).
 
 **(Stukowski)** Stukowski, Modelling Simul Mater Sci Eng, 18, 015012
 (2010).
+
+.. _ws-Wang:
+
+**(Wang)** Wang, Li, Fu, Fu, and Gou, Comput Phys Commun, 299, 109138
+(2024).

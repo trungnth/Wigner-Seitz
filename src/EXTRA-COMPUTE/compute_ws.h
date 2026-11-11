@@ -46,6 +46,18 @@ class ComputeWS : public Compute {
 
   char *reffile;      // dump file with the reference sites (reference keyword), or nullptr
   int affine_flag;    // 1 = map positions into the box of the reference (affine yes)
+  int drift_flag;     // 1 = follow a translation of the crystal (drift yes)
+
+  double drift[3];         // translation of the crystal for the next analysis (reference frame)
+  double drift_used[3];    // translation used by the last analysis (output)
+  double drift_margin;     // largest translation the communication cutoff can follow
+  double rcert_all;        // r_min/2 of all sites (smallest over all ranks)
+  int drift_warned;        // 1 after the warning about a displaced crystal (drift no)
+  int jump_warned;         // 1 after the warning about a large move between analyses
+  int converge_warned;     // 1 after the warning about a translation that did not converge
+  int margin_warned;       // 1 after the warning about the communication cutoff
+  char *id_fix;            // internal fix that keeps the translation in restart files
+  class FixStoreGlobal *fix_drift;
 
   int nref;               // stored sites of this rank (owned first, then ghost sites)
   int nref_owned;         // sites owned by this rank
@@ -99,6 +111,8 @@ class ComputeWS : public Compute {
   void check_reference();
   void grow_reference(int);
   void build_container();
+  void build_bins();
+  void reset_drift();
   void check_ghost_cutoff();
   void sub_domain(double *) const;
   int geometry_changed();

@@ -10,17 +10,20 @@ configuration. In one invocation it gives:
 
 The reference is either the group atoms at the start of the run or a dump
 file. With `affine yes` the box may change size and shape, e.g. under
-NPT. The compute needs no external library. Between MPI processes it
-exchanges only one sum of five integer counters per invocation,
-whatever the number of atoms. Its results agree exactly with the
-Wigner-Seitz modifier of OVITO.
+NPT. With `drift yes` the compute follows a rigid translation of the
+crystal relative to the reference, e.g. from the momentum of a primary
+knock-on atom. The compute needs no external library. Between MPI
+processes it exchanges only one sum of nine integer counters per
+assignment of the atoms (one per invocation, a few with `drift yes`),
+whatever the number of atoms. Without `drift yes`, its results agree
+exactly with the Wigner-Seitz modifier of OVITO.
 
 ## Contents
 
 ```
 src/EXTRA-COMPUTE/compute_ws.h, compute_ws.cpp   source code
 doc/src/compute_ws.rst                            documentation page (LAMMPS format)
-unittest/commands/test_compute_ws.cpp             unit tests (GoogleTest, 50 tests)
+unittest/commands/test_compute_ws.cpp             unit tests (GoogleTest, 60 tests)
 examples/PACKAGES/ws/                             example: displacement cascade in SiC
     in.ws                                         input script
     ws_sublattice.py                              per-type and sublattice statistics
@@ -62,8 +65,36 @@ The nearest site is found exactly; no cells are constructed:
 
 Each MPI rank keeps the sites of its local and ghost atoms only. Defects
 are classified on the sites it owns, and the counts are summed in one
-`MPI_Allreduce` of five 64-bit integer counters (40 bytes), whatever the
-number of atoms.
+`MPI_Allreduce` of nine 64-bit integer counters (72 bytes) per assignment,
+whatever the number of atoms.
+
+### Drift of the crystal (`drift yes`)
+
+The crystal can move as a whole relative to the box: by the momentum of a
+primary knock-on atom that is not compensated, by a thermostat that does
+not conserve the total momentum, or by defects that migrate while the
+center of mass stays fixed (Wang et al. 2024). With a fixed reference, a
+drift by a sizable fraction of the distance between sites produces false
+Frenkel pairs. With `drift yes`:
+
+- The translation t is measured at every analysis as a weighted mean of
+  the displacements of the atoms from their sites. An atom closer than
+  r_min/4 to its site has weight 1, the weight falls smoothly to 0 at
+  r_min/2, and farther atoms (interstitials, displaced atoms of a cascade)
+  do not count. Such atoms certainly belong to their site, so t changes
+  continuously with the positions.
+- The atoms are assigned at x - t, starting from t of the previous
+  analysis, and t is corrected until it changes by less than
+  1e-6 r_min/2 (one assignment if the crystal has not moved, two or
+  more if it has).
+- The sums are 64-bit integers in fixed point, so t is the same on any
+  number of MPI ranks, and a rigidly moved copy of the crystal gives the
+  same result.
+- t is added to the global vector, and vacancies are reported at the
+  moved sites.
+
+Without the keyword, every 16th atom (by ID) estimates t, only for a
+warning that is printed once if t exceeds 25% of r_min/2.
 
 ## Requirements
 
@@ -122,13 +153,15 @@ same style name in `src/VORONOI/`. Remove `src/VORONOI/compute_ws.h` and
 compute ID group-ID ws keyword value ...
 ```
 
-Keywords (both optional):
+Keywords (all optional):
 
 - `reference file`: read the sites from the first snapshot of a dump
   file. The default is the group atoms at the start of the first run.
 - `affine yes|no`: with `yes`, map the positions into the box of the
   reference before the analysis. The default is `no`, which requires the
   box of the reference.
+- `drift yes|no`: with `yes`, follow a rigid translation of the crystal
+  relative to the reference. The default is `no`.
 
 Examples:
 
@@ -136,15 +169,16 @@ Examples:
 compute 1 all ws
 compute 2 metal ws affine yes
 compute 3 all ws reference ref.dump affine yes
+compute 4 all ws drift yes
 ```
 
 ### Output
 
 | Output                       | Values                                                        | Use in                                   |
 |------------------------------|---------------------------------------------------------------|------------------------------------------|
-| global vector (4)            | interstitials, vacancies, replacements, antisites             | `thermo_style`, equal-style variables    |
+| global vector (4, or 7)      | interstitials, vacancies, replacements, antisites; with `drift yes` also the translation tx, ty, tz | `thermo_style`, equal-style variables    |
 | per-atom array (3 columns)   | occupancy of the atom's site, site ID, site type              | `dump custom`, atom-style variables      |
-| local array (5 columns)      | site ID, site type, x, y, z of each vacant site               | `dump local`                             |
+| local array (5 columns)      | site ID, site type, x, y, z of each vacant site (moved by the translation with `drift yes`) | `dump local`                             |
 
 All per-atom values are 0 for atoms outside the group or not assigned to a
 site. The global values are intensive: `thermo_modify norm` does not scale
@@ -154,8 +188,8 @@ N_int - N_vac = N_group - N_sites.
 ### Typical use during a cascade
 
 ```
-compute         ws all ws
-thermo_style    custom step temp pe c_ws[1] c_ws[2] c_ws[3] c_ws[4]
+compute         ws all ws drift yes
+thermo_style    custom step temp pe c_ws[1] c_ws[2] c_ws[3] c_ws[4] c_ws[5] c_ws[6] c_ws[7]
 
 # vacancies
 dump            vac all local 1000 vac.*.dump index c_ws[1] c_ws[2] c_ws[3] c_ws[4] c_ws[5]
@@ -184,7 +218,19 @@ type and per sublattice can therefore be done in post-processing; see
   replacements are meaningful.
 - A restart file does not store the reference. A job started from a
   restart file uses the crystal at its start, unless it reads a reference
-  file.
+  file. With `drift yes`, the translation is stored in the restart file;
+  a compute with the same ID that reads the same reference file continues
+  with it.
+- With `drift yes`:
+  - the crystal must move by less than r_min/2 between two analyses, so
+    invoke the compute often enough (LAMMPS warns above r_min/4);
+  - the communication cutoff must exceed the cutoff needed for the sites
+    (see below) by the accumulated translation (LAMMPS warns otherwise);
+  - only a translation is followed, not a rotation or local motions of
+    the lattice, e.g. near moving dislocations or grain boundaries.
+- A crystal with extended defects, such as dislocations, should be
+  referenced to its own relaxed initial configuration, not to a perfect
+  lattice.
 - Between runs, the output is that of the last analysis. After
   `create_atoms`, `delete_atoms` or `displace_atoms`, use `run 0` before
   using the compute again.
@@ -217,6 +263,7 @@ The complete description is in `doc/src/compute_ws.rst`.
 
 - 1000 atoms, pair style `gw/zbl`;
 - a Berendsen thermostat on the border;
+- `drift yes`, with the translation printed in the thermo output;
 - about 4 s on one core.
 
 It writes the vacancy and defect dumps of the workflow above at the first
@@ -230,9 +277,16 @@ python3 ws_sublattice.py .
 
 Outside the LAMMPS tree, set `LAMMPS_POTENTIALS` to the `potentials/`
 directory of LAMMPS, so that `SiC.gw.zbl` is found. The setup is
-deterministic: with 1 and 4 MPI ranks the defects are the same (6
-interstitials, 6 vacancies, 3 replacements, 1 antisite), and the thermo
-output differs only by round-off.
+deterministic: with 1 and 4 MPI ranks the defects are the same (5
+interstitials, 5 vacancies, 3 replacements, 2 antisites at the end), and
+the thermo output differs only by round-off.
+
+The momentum of the primary knock-on atom is not removed in the example,
+so the crystal drifts by 0.28 A along the direction of the recoil by the
+last step. Without `drift yes` (`compute ws_map all ws`), the last step
+has 6 interstitials, 6 vacancies, 3 replacements and 1 antisite: a few
+atoms of the damaged region, near the boundary between two sites, are
+assigned to the other site.
 
 ## Tests
 
@@ -243,13 +297,19 @@ ctest --test-dir build -R ComputeWS -V
 mpirun -np 4 build/test_compute_ws
 ```
 
-The 50 tests check the following:
+The 60 tests check the following:
 
 - every atom against a brute-force nearest-site search, in orthogonal,
   triclinic, `comm_style tiled` and non-periodic boxes;
 - a known set of defects, with exact global, per-atom and local output;
 - reference files, the affine mapping, `rerun`, restart, `balance`, and
   use between runs;
+- the `drift` keyword (10 tests): the same output as without it for a
+  crystal that does not move; sudden and gradual rigid moves, up to 2.5
+  times the distance from a site to its cell faces, without false defects
+  and with a translation equal to the move; known defects moving with the
+  crystal; drift together with the affine mapping; continuation after a
+  restart; independence of the history of the translation;
 - the warnings and the errors.
 
 They pass with 1, 2, 4 and 8 MPI ranks, also with `LAMMPS_SIZES=bigbig`.
@@ -262,6 +322,9 @@ reference and a current configuration. The current file must contain the
 per-atom array of the compute. The script compares the output for every
 atom and every vacant site, and writes the OVITO result in the format of
 LAMMPS dumps:
+
+The script compares the analysis without `drift yes`: OVITO uses the
+reference sites as they are.
 
 ```
 write_dump all custom ref.dump id type x y z modify format float %20.15g      # before the run
@@ -296,6 +359,27 @@ differences only at ties, and 1 for other differences.
   and all 221 vacancies at the last step are identical to OVITO.
 - **Reruns:** a cascade trajectory rerun with 1, 4 and 36 MPI ranks gives
   byte-identical dump files.
+- **`drift yes`** (LAMMPS develop, 2-core virtual machine):
+  - the trajectory of the example and a copy moved by a rigid,
+    time-dependent translation of up to 4.9 A give the same counts and
+    the same site for every atom in all 16 frames; the measured
+    translations differ by the added shift within 6e-7 A. Without the
+    keyword the moved copy has up to 448 Frenkel pairs where the original
+    has 9;
+  - the same with 1, 2, 4 and 8 MPI ranks: identical counts, translations
+    and per-atom output;
+  - a thermal crystal moved rigidly in 30 steps by up to three times the
+    site-to-face distance (Cu at 300 K, W at 1500 K): no defects, and a
+    translation equal to the move. Without the keyword, up to 5727 (Cu)
+    and 2928 (W) false Frenkel pairs;
+  - the drifted configurations of Wang et al. (2024): W 19 interstitials
+    and no vacancy (66 / 47 without the keyword), Cu 3 and none
+    (224 / 221);
+  - without `drift yes` the results are bit-identical to the version
+    without the keyword.
+- Cost of `drift yes` (zinc blende, 10^6 atoms, 1 rank, 2-core virtual
+  machine): 32 ms per invocation for static atoms and 49 ms when the
+  crystal moves between invocations, against 28 ms without the keyword.
 
 Time per invocation, measured on one node of the HybriLIT cluster (JINR):
 
@@ -333,6 +417,20 @@ invocation and `compute ws` 3.6 ms.
 - A. Stukowski, *Visualization and analysis of atomistic simulation data
   with OVITO - the Open Visualization Tool*, Modelling Simul. Mater. Sci.
   Eng. 18, 015012 (2010).
+- J. Wang, T. Li, Z. Fu, B. Fu, C. Gou, *Identification of
+  self-interstitial atoms and vacancies in crystalline materials in
+  atomistic simulation*, Comput. Phys. Commun. 299, 109138 (2024).
+
+## Changes
+
+- Keyword `drift` (follow a rigid translation of the crystal). Without
+  it the analysis is unchanged: the counts, per-atom values and vacancies
+  are bit-identical to the first version, and a warning is printed once
+  if the crystal has drifted. The global vector has 7 elements with
+  `drift yes`. The example uses `drift yes`.
+- 6 November 2026: first version in this repository (exact nearest-site
+  search without Voro++; keywords `reference` and `affine`). It replaces
+  an earlier version based on the Voro++ library.
 
 ## Author
 

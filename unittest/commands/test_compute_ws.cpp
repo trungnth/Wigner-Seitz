@@ -18,7 +18,9 @@
 // quantities are rebuilt from the per-atom and local outputs, as users do
 // in post-processing. Every check uses globally
 // reduced values or is restricted to the rank that owns an atom, so the
-// same binary is valid for any number of MPI ranks:
+// same binary is valid for any number of MPI ranks. The tests of the drift
+// keyword (ComputeWSDriftTest) move the same crystal rigidly with
+// displace_atoms to model a drift of the lattice relative to the box:
 //
 //   ./test_compute_ws                   serial
 //   mpirun -np 4 ./test_compute_ws      decomposition independence
@@ -32,6 +34,7 @@
 #include "group.h"
 #include "info.h"
 #include "input.h"
+#include "lattice.h"
 #include "modify.h"
 #include "utils.h"
 
@@ -55,6 +58,7 @@
 // whether to print verbose output (i.e. not capturing LAMMPS screen output).
 bool verbose = false;
 
+using LAMMPS_NS::bigint;
 using LAMMPS_NS::Compute;
 using LAMMPS_NS::tagint;
 using ::testing::HasSubstr;
@@ -1368,6 +1372,10 @@ TEST_F(ComputeWSTest, KeywordErrors)
                      command("compute ws all ws bogus yes"););
     TEST_FAILURE_MPI(".*ERROR: Expected boolean parameter.*",
                      command("compute ws all ws affine maybe"););
+    TEST_FAILURE_MPI(".*ERROR: Illegal compute ws drift command: missing argument.*",
+                     command("compute ws all ws drift"););
+    TEST_FAILURE_MPI(".*ERROR: Expected boolean parameter.*",
+                     command("compute ws all ws drift maybe"););
 }
 
 // ---------------------------------------------------------------------------
@@ -1563,6 +1571,515 @@ TEST_F(ComputeWSTest, BruteForceReferenceFileTriclinic)
     const auto ref = gather_sites();
     ASSERT_NE(displace_and_run(ref), nullptr);
     remove_file("ws_site.dump");
+}
+
+// ---------------------------------------------------------------------------
+// drift keyword: rigid translation of the crystal relative to the reference
+// ---------------------------------------------------------------------------
+
+class ComputeWSDriftTest : public LAMMPSTest {
+protected:
+    void SetUp() override
+    {
+        testbinary = "ComputeWSDriftTest";
+        LAMMPSTest::SetUp();
+        if (!info->has_style("compute", "ws")) GTEST_SKIP() << "compute ws is not available";
+    }
+
+    void TearDown() override
+    {
+        if (lmp) {
+            MPI_Barrier(lmp->world);
+            if (lmp->comm->me == 0) {
+                for (const char *name : {"ws_drift_site.dump", "ws_drift.restart"})
+                    std::remove(name);
+            }
+        }
+        LAMMPSTest::TearDown();
+    }
+
+    // L1_2-ordered fcc crystal in LJ units
+    void create_crystal(bool triclinic = false)
+    {
+        BEGIN_HIDE_OUTPUT();
+        command("units lj");
+        command("atom_style atomic");
+        command("atom_modify map array");
+        command("boundary p p p");
+        command("lattice fcc 0.8442");
+        command("region box block 0 8 0 8 0 8");
+        command("create_box 2 box");
+        command("create_atoms 1 box basis 1 1 basis 2 2 basis 3 2 basis 4 2");
+        if (triclinic) command("change_box all triclinic");
+        command("mass * 1.0");
+        command("pair_style lj/cut 2.5");
+        command("pair_coeff * * 1.0 1.0");
+        command("neighbor 0.3 bin");
+        END_HIDE_OUTPUT();
+    }
+
+    // half the nearest-neighbor distance of the fcc lattice = distance of a site
+    // to the faces of its Wigner-Seitz cell
+    double half_nn() const { return lmp->domain->lattice->xlattice * std::sqrt(2.0) / 4.0; }
+
+    // computes with the given IDs and options; thermo output invokes all of them
+    void define_computes(const std::vector<std::pair<std::string, std::string>> &computes)
+    {
+        std::string thermo = "thermo_style custom step";
+        BEGIN_HIDE_OUTPUT();
+        for (const auto &c : computes) {
+            command("compute " + c.first + " all " + c.second);
+            thermo += " c_" + c.first + "[1] c_" + c.first + "[2] c_" + c.first + "[3]";
+        }
+        command(thermo);
+        END_HIDE_OUTPUT();
+    }
+
+    void run0()
+    {
+        BEGIN_HIDE_OUTPUT();
+        command("run 0 post no");
+        END_HIDE_OUTPUT();
+    }
+
+    std::string run0_output()
+    {
+        BEGIN_CAPTURE_OUTPUT();
+        command("run 0 post no");
+        return END_CAPTURE_OUTPUT();
+    }
+
+    Compute *get(const std::string &id) { return lmp->modify->get_compute_by_id(id); }
+
+    // rigid move of all atoms (a drift of the crystal), in distance units
+    void move(double dx, double dy, double dz)
+    {
+        BEGIN_HIDE_OUTPUT();
+        command(
+            fmt::format("displace_atoms all move {:.15g} {:.15g} {:.15g} units box", dx, dy, dz));
+        END_HIDE_OUTPUT();
+    }
+
+    // known defects as in ComputeWSTest, followed by small random displacements
+    void create_defects()
+    {
+        BEGIN_HIDE_OUTPUT();
+        command("region v1 sphere 2.0 2.0 2.0 0.1 units lattice");
+        command("region v2 sphere 2.5 2.5 2.0 0.1 units lattice");
+        command("region as sphere 3.0 3.0 3.0 0.1 units lattice");
+        command("region rp sphere 6.0 6.0 6.0 0.1 units lattice");
+        command("delete_atoms region v1 compress no");
+        command("delete_atoms region v2 compress no");
+        command("set region as type 2");
+        command("delete_atoms region rp compress no");
+        command("create_atoms 1 single 6.0 6.0 6.0 units lattice");
+        command("create_atoms 2 single 5.5 5.15 5.0 units lattice");
+        command("displace_atoms all random 0.03 0.03 0.03 4711 units lattice");
+        END_HIDE_OUTPUT();
+    }
+
+    // number of local atoms (summed over ranks) whose per-atom rows differ
+    int peratom_differences(Compute *a, Compute *b)
+    {
+        a->compute_peratom();
+        b->compute_peratom();
+        int diff = 0;
+        for (int i = 0; i < lmp->atom->nlocal; i++)
+            for (int k = 0; k < 3; k++)
+                if (a->array_atom[i][k] != b->array_atom[i][k]) {
+                    diff++;
+                    break;
+                }
+        int all = 0;
+        MPI_Allreduce(&diff, &all, 1, MPI_INT, MPI_SUM, lmp->world);
+        return all;
+    }
+
+    // number of atoms (all ranks) on a site with another ID than their own
+    int other_site_count(Compute *c)
+    {
+        c->compute_peratom();
+        int n = 0;
+        for (int i = 0; i < lmp->atom->nlocal; i++)
+            if ((tagint)c->array_atom[i][1] != lmp->atom->tag[i]) n++;
+        int all = 0;
+        MPI_Allreduce(&n, &all, 1, MPI_INT, MPI_SUM, lmp->world);
+        return all;
+    }
+
+    // checksum of the site assignment of all atoms, independent of how the atoms are
+    // distributed over the ranks: sum of site ID * (atom ID mod 997 + 1)
+    bigint site_checksum(Compute *c)
+    {
+        c->compute_peratom();
+        bigint sum = 0;
+        for (int i = 0; i < lmp->atom->nlocal; i++)
+            sum += (bigint)c->array_atom[i][1] * (lmp->atom->tag[i] % 997 + 1);
+        bigint all = 0;
+        MPI_Allreduce(&sum, &all, 1, MPI_LMP_BIGINT, MPI_SUM, lmp->world);
+        return all;
+    }
+
+    // largest deviation (over ranks) of the vacancy positions of c from those of ref
+    // moved by (sx, sy, sz); both computes own the same sites in the same order
+    double vacancy_deviation(Compute *c, Compute *ref, double sx, double sy, double sz)
+    {
+        c->compute_local();
+        ref->compute_local();
+        double dev = (c->size_local_rows == ref->size_local_rows) ? 0.0 : 1.0e30;
+        if (dev == 0.0) {
+            for (int r = 0; r < c->size_local_rows; r++) {
+                if (c->array_local[r][0] != ref->array_local[r][0]) dev = 1.0e30;
+                const double s[3] = {sx, sy, sz};
+                for (int d = 0; d < 3; d++)
+                    dev = std::max(dev, std::fabs(c->array_local[r][2 + d] -
+                                                  (ref->array_local[r][2 + d] + s[d])));
+            }
+        }
+        double all = 0.0;
+        MPI_Allreduce(&dev, &all, 1, MPI_DOUBLE, MPI_MAX, lmp->world);
+        return all;
+    }
+};
+
+// drift no reproduces the default, and drift yes does as long as the crystal does not move
+TEST_F(ComputeWSDriftTest, SameAsDefaultWithoutDrift)
+{
+    create_crystal();
+    define_computes({{"ws", "ws"}, {"wd", "ws drift no"}, {"wy", "ws drift yes"}});
+    run0();
+    create_defects();
+    run0();
+
+    Compute *ws = get("ws");
+    Compute *wd = get("wd");
+    Compute *wy = get("wy");
+    ASSERT_NE(ws, nullptr);
+    ASSERT_NE(wd, nullptr);
+    ASSERT_NE(wy, nullptr);
+
+    ASSERT_EQ(wd->size_vector, 4);
+    ASSERT_EQ(wy->size_vector, 7);
+    EXPECT_EQ(wy->extvector, 0);
+    for (int k = 0; k < 4; k++) {
+        EXPECT_DOUBLE_EQ(wd->vector[k], ws->vector[k]) << "vector element " << k + 1;
+        EXPECT_DOUBLE_EQ(wy->vector[k], ws->vector[k]) << "vector element " << k + 1;
+    }
+    EXPECT_DOUBLE_EQ(ws->vector[0], 1.0);
+    EXPECT_DOUBLE_EQ(ws->vector[1], 2.0);
+    EXPECT_DOUBLE_EQ(ws->vector[2], 1.0);
+    EXPECT_DOUBLE_EQ(ws->vector[3], 1.0);
+
+    // translation = mean of the random displacements (rms about 7e-4 per component)
+    for (int d = 0; d < 3; d++)
+        EXPECT_LT(std::fabs(wy->vector[4 + d]), 3.0e-3);
+
+    EXPECT_EQ(peratom_differences(ws, wd), 0);
+    EXPECT_EQ(peratom_differences(ws, wy), 0);
+    EXPECT_EQ(vacancy_deviation(wd, ws, 0.0, 0.0, 0.0), 0.0);
+    EXPECT_LT(vacancy_deviation(wy, ws, wy->vector[4], wy->vector[5], wy->vector[6]), 1.0e-12);
+}
+
+// a sudden rigid move by 0.9 of the distance to the cell faces: false defects without
+// the drift keyword, none with it, and the measured translation equals the move
+TEST_F(ComputeWSDriftTest, SuddenMoveCorrected)
+{
+    create_crystal();
+    define_computes({{"ws", "ws"}, {"wd", "ws drift no"}, {"wy", "ws drift yes"}});
+    run0();
+    BEGIN_HIDE_OUTPUT();
+    command("displace_atoms all random 0.05 0.05 0.05 8123 units lattice");
+    END_HIDE_OUTPUT();
+    run0();
+    Compute *wy = get("wy");
+    ASSERT_NE(wy, nullptr);
+    const double t0[3] = {wy->vector[4], wy->vector[5], wy->vector[6]};
+    EXPECT_DOUBLE_EQ(get("ws")->vector[0], 0.0);
+
+    const double d = 0.9 * half_nn() / std::sqrt(2.0);
+    move(d, d, 0.0);
+    auto output = run0_output();
+    if (lmp->comm->me == 0) {
+        EXPECT_THAT(output, HasSubstr("displaced from the reference sites")); // drift no
+        EXPECT_THAT(output, HasSubstr("the crystal moved by")); // drift yes, sudden move
+    }
+
+    Compute *ws = get("ws");
+    Compute *wd = get("wd");
+    EXPECT_GT(ws->vector[0] + ws->vector[2], 0.0) << "the move should produce false defects";
+    for (int k = 0; k < 4; k++) {
+        EXPECT_DOUBLE_EQ(wd->vector[k], ws->vector[k]);
+        EXPECT_DOUBLE_EQ(wy->vector[k], 0.0) << "vector element " << k + 1;
+    }
+    // the translation is converged, so it changed by the move
+    EXPECT_NEAR(wy->vector[4] - t0[0], d, 1.0e-6);
+    EXPECT_NEAR(wy->vector[5] - t0[1], d, 1.0e-6);
+    EXPECT_NEAR(wy->vector[6] - t0[2], 0.0, 1.0e-6);
+}
+
+// gradual moves add up to more than one nearest-neighbor distance: with drift yes every
+// atom stays on its own site; without, all atoms end up on other sites
+TEST_F(ComputeWSDriftTest, GradualMoveBeyondNeighborDistance)
+{
+    create_crystal();
+    BEGIN_HIDE_OUTPUT();
+    command("comm_modify cutoff 4.0");
+    END_HIDE_OUTPUT();
+    define_computes({{"ws", "ws"}, {"wy", "ws drift yes"}});
+    run0();
+
+    const double step = 0.25 * half_nn() / std::sqrt(2.0);
+    for (int n = 0; n < 10; n++) {
+        move(step, step, 0.0);
+        run0();
+        Compute *wy = get("wy");
+        for (int k = 0; k < 4; k++)
+            EXPECT_DOUBLE_EQ(wy->vector[k], 0.0) << "move " << n + 1 << " element " << k + 1;
+    }
+    Compute *wy = get("wy");
+    Compute *ws = get("ws");
+    // a perfect crystal: the translation follows every move exactly
+    EXPECT_NEAR(wy->vector[4], 10 * step, 1.0e-6);
+    EXPECT_NEAR(wy->vector[5], 10 * step, 1.0e-6);
+    EXPECT_NEAR(wy->vector[6], 0.0, 1.0e-6);
+    // total move 2.5 * half_nn: every atom is nearest to a neighbor site
+    EXPECT_DOUBLE_EQ(ws->vector[0], 0.0);
+    EXPECT_DOUBLE_EQ(ws->vector[2], (double)NSITES);
+
+    EXPECT_EQ(other_site_count(wy), 0);
+    EXPECT_EQ(other_site_count(ws), NSITES);
+}
+
+// known defects stay the same when the crystal moves; vacancies move with it
+TEST_F(ComputeWSDriftTest, KnownDefectsMoveWithCrystal)
+{
+    create_crystal();
+    BEGIN_HIDE_OUTPUT();
+    command("comm_modify cutoff 4.0");
+    END_HIDE_OUTPUT();
+    define_computes({{"ws", "ws"}, {"wy", "ws drift yes"}});
+    run0();
+    create_defects();
+    run0();
+    Compute *ws = get("ws");
+    Compute *wy = get("wy");
+    const std::vector<double> before(ws->vector, ws->vector + 4);
+    const bigint checksum = site_checksum(ws);
+    const int other       = other_site_count(ws);
+
+    // vacancy rows of this rank (owned sites do not change rank)
+    ws->compute_local();
+    std::vector<std::vector<double>> vac;
+    for (int r = 0; r < ws->size_local_rows; r++)
+        vac.emplace_back(ws->array_local[r], ws->array_local[r] + 5);
+
+    // six moves of 0.2 * half_nn along [101]: beyond the cell faces
+    const double step = 0.2 * half_nn() / std::sqrt(2.0);
+    for (int n = 0; n < 6; n++) {
+        move(step, 0.0, step);
+        run0();
+    }
+    for (int k = 0; k < 4; k++)
+        EXPECT_DOUBLE_EQ(wy->vector[k], before[k]) << "vector element " << k + 1;
+    EXPECT_GT(ws->vector[2], before[2] + NSITES / 2) << "expected false replacements";
+    EXPECT_EQ(site_checksum(wy), checksum);
+    EXPECT_EQ(other_site_count(wy), other);
+
+    // vacancies at the reference sites moved by the translation used
+    wy->compute_local();
+    double dev = (wy->size_local_rows == (int)vac.size()) ? 0.0 : 1.0e30;
+    if (dev == 0.0) {
+        for (int r = 0; r < wy->size_local_rows; r++) {
+            if (wy->array_local[r][0] != vac[r][0]) dev = 1.0e30;
+            for (int d = 0; d < 3; d++)
+                dev = std::max(dev, std::fabs(wy->array_local[r][2 + d] -
+                                              (vac[r][2 + d] + wy->vector[4 + d])));
+        }
+    }
+    double alldev = 0.0;
+    MPI_Allreduce(&dev, &alldev, 1, MPI_DOUBLE, MPI_MAX, lmp->world);
+    EXPECT_LT(alldev, 1.0e-12);
+}
+
+// affine mapping of a homogeneous deformation and a translation together
+TEST_F(ComputeWSDriftTest, AffineAndDrift)
+{
+    create_crystal(true);
+    define_computes({{"wy", "ws affine yes drift yes"}, {"wa", "ws affine yes"}});
+    run0();
+    BEGIN_HIDE_OUTPUT();
+    command("change_box all x scale 1.02 y scale 0.99 xy delta 0.3 remap");
+    END_HIDE_OUTPUT();
+    const double d = 0.15 * half_nn();
+    for (int n = 0; n < 5; n++) {
+        move(d, -d, 0.5 * d);
+        run0();
+    }
+    Compute *wy = get("wy");
+    Compute *wa = get("wa");
+    for (int k = 0; k < 4; k++)
+        EXPECT_DOUBLE_EQ(wy->vector[k], 0.0) << "vector element " << k + 1;
+    EXPECT_GT(wa->vector[0] + wa->vector[2], 0.0) << "expected false defects without drift";
+}
+
+// with a reference file, a restart continues with the stored translation; a compute
+// with another ID starts from zero and matches the atoms with neighbor sites
+TEST_F(ComputeWSDriftTest, ReferenceFileRestart)
+{
+    create_crystal();
+    BEGIN_HIDE_OUTPUT();
+    command("comm_modify cutoff 4.0");
+    command("write_dump all custom ws_drift_site.dump id type x y z modify format float %20.15g");
+    END_HIDE_OUTPUT();
+    define_computes({{"wy", "ws reference ws_drift_site.dump drift yes"}});
+    run0();
+    const double step = 0.25 * half_nn() / std::sqrt(2.0);
+    for (int n = 0; n < 10; n++) {
+        move(step, step, 0.0);
+        run0();
+    }
+    EXPECT_DOUBLE_EQ(get("wy")->vector[2], 0.0);
+
+    BEGIN_HIDE_OUTPUT();
+    command("write_restart ws_drift.restart");
+    command("clear");
+    command("read_restart ws_drift.restart");
+    command("comm_modify cutoff 4.0");
+    END_HIDE_OUTPUT();
+    BEGIN_CAPTURE_OUTPUT();
+    command("compute wy all ws reference ws_drift_site.dump drift yes");
+    command("compute wz all ws reference ws_drift_site.dump drift yes");
+    command("thermo_style custom step c_wy[1] c_wy[2] c_wy[3] c_wz[1] c_wz[2] c_wz[3]");
+    command("run 0 post no");
+    auto output = END_CAPTURE_OUTPUT();
+    if (lmp->comm->me == 0) {
+        EXPECT_THAT(output, HasSubstr("taken from the restart file"));
+    }
+
+    Compute *wy = get("wy");
+    Compute *wz = get("wz");
+    ASSERT_NE(wy, nullptr);
+    ASSERT_NE(wz, nullptr);
+    for (int k = 0; k < 4; k++)
+        EXPECT_DOUBLE_EQ(wy->vector[k], 0.0) << "vector element " << k + 1;
+    EXPECT_NEAR(wy->vector[4], 10 * step, 1.0e-6);
+    EXPECT_NEAR(wy->vector[5], 10 * step, 1.0e-6);
+    EXPECT_DOUBLE_EQ(wz->vector[0], 0.0);
+    EXPECT_DOUBLE_EQ(wz->vector[1], 0.0);
+    EXPECT_DOUBLE_EQ(wz->vector[2], (double)NSITES);
+}
+
+// without the keyword a displaced crystal is reported once
+TEST_F(ComputeWSDriftTest, WarningWithoutDrift)
+{
+    create_crystal();
+    define_computes({{"wd", "ws drift no"}});
+    run0();
+    const double d = 0.4 * half_nn() / std::sqrt(2.0);
+    move(d, d, 0.0);
+    auto output = run0_output();
+    if (lmp->comm->me == 0) {
+        EXPECT_THAT(output, HasSubstr("displaced from the reference sites"));
+    }
+    EXPECT_DOUBLE_EQ(get("wd")->vector[0], 0.0);
+    move(d, d, 0.0);
+    output = run0_output();
+    if (lmp->comm->me == 0) {
+        EXPECT_THAT(output, Not(HasSubstr("displaced from the reference sites")));
+    }
+}
+
+// a translation beyond the margin of the communication cutoff is reported
+TEST_F(ComputeWSDriftTest, CutoffMarginWarning)
+{
+    create_crystal();
+    define_computes({{"wy", "ws drift yes"}});
+    run0();
+    const double step = 0.25 * half_nn() / std::sqrt(2.0);
+    std::string output;
+    for (int n = 0; n < 12; n++) {
+        move(step, step, 0.0);
+        output += run0_output();
+    }
+    if (lmp->comm->me == 0) {
+        EXPECT_THAT(output, HasSubstr("exceeds the margin"));
+    }
+}
+
+// a perfect crystal moved rigidly: the translation is exact up to the fixed-point
+// resolution, on any number of ranks
+TEST_F(ComputeWSDriftTest, ExactTranslationOfPerfectCrystal)
+{
+    create_crystal();
+    define_computes({{"wy", "ws drift yes"}});
+    run0();
+    const double d[3] = {0.1 * half_nn(), -0.2 * half_nn(), 0.05 * half_nn()};
+    move(d[0], d[1], d[2]);
+    run0();
+    move(0.0, 0.0, 0.0);
+    run0();
+    Compute *wy = get("wy");
+    for (int k = 0; k < 3; k++)
+        EXPECT_NEAR(wy->vector[4 + k], d[k], 1.0e-8) << "component " << k + 1;
+}
+
+// an atom 1e-4 from the face between its site A and a vacant neighbor site B: a compute
+// that followed the crystal and a compute that starts from zero must find the same
+// translation and assignment. With a plain mean over the atoms alone on a site, both
+// assignments of this atom would be self-consistent (their translations differ by about
+// r_min/N), and the first assignment of each compute would decide between them.
+TEST_F(ComputeWSDriftTest, SolutionIndependentOfHistory)
+{
+    create_crystal();
+    BEGIN_HIDE_OUTPUT();
+    command("comm_modify cutoff 4.0");
+    command("write_dump all custom ws_drift_site.dump id type x y z modify format float %20.15g");
+    END_HIDE_OUTPUT();
+    define_computes({{"wy", "ws reference ws_drift_site.dump drift yes"}});
+    run0();
+
+    // vacancy at B = A + (1/2, 1/2, 0) a; the atom of A moves to eta short of the face
+    const double a   = lmp->domain->lattice->xlattice;
+    const double eta = 1.0e-4;
+    const double q   = 0.25 * a - eta / std::sqrt(2.0);
+    BEGIN_HIDE_OUTPUT();
+    command("region rb sphere 4.5 4.5 4.0 0.1 units lattice");
+    command("delete_atoms region rb compress no");
+    command("region ra sphere 4.0 4.0 4.0 0.1 units lattice");
+    command("group ga region ra");
+    command(fmt::format("displace_atoms ga move {:.15g} {:.15g} 0.0 units box", q, q));
+    END_HIDE_OUTPUT();
+    run0();
+
+    // wy follows two moves parallel to the face, then a move by 2 eta toward B and
+    // 0.3 r_min/2 along z; wz starts from zero after that last move
+    const double h = half_nn();
+    for (int n = 0; n < 2; n++) {
+        move(0.1 * h, -0.1 * h, 0.05 * h);
+        run0();
+    }
+    move(std::sqrt(2.0) * eta, std::sqrt(2.0) * eta, 0.3 * h);
+    BEGIN_HIDE_OUTPUT();
+    command("compute wz all ws reference ws_drift_site.dump drift yes");
+    command("thermo_style custom step c_wy[1] c_wy[2] c_wy[3] c_wz[1] c_wz[2] c_wz[3]");
+    END_HIDE_OUTPUT();
+    run0();
+
+    Compute *wy = get("wy");
+    Compute *wz = get("wz");
+    ASSERT_NE(wy, nullptr);
+    ASSERT_NE(wz, nullptr);
+    for (int k = 0; k < 4; k++)
+        EXPECT_DOUBLE_EQ(wz->vector[k], wy->vector[k]) << "vector element " << k + 1;
+    for (int d = 0; d < 3; d++)
+        EXPECT_NEAR(wz->vector[4 + d], wy->vector[4 + d], 1.0e-6) << "component " << d + 1;
+    EXPECT_EQ(peratom_differences(wy, wz), 0);
+
+    // relative to the translation, the atom is still on the side of A: one vacancy (B)
+    EXPECT_DOUBLE_EQ(wy->vector[0], 0.0);
+    EXPECT_DOUBLE_EQ(wy->vector[1], 1.0);
+    EXPECT_DOUBLE_EQ(wy->vector[2], 0.0);
+    EXPECT_DOUBLE_EQ(wy->vector[3], 0.0);
 }
 
 int main(int argc, char **argv)
